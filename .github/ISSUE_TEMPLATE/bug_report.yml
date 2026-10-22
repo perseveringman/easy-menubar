@@ -1,0 +1,20 @@
+name: 问题反馈
+description: 报告图标、权限或应用行为问题
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Bar 版本与 macOS 版本
+    validations:
+      required: true
+  - type: input
+    id: owner
+    attributes:
+      label: 图标所属应用与版本
+  - type: textarea
+    id: steps
+    attributes:
+      label: 操作步骤、预期与实际结果
+      description: 说明辅助功能是否授权、是否同时运行其他菜单栏管理器。不要附上完整偏好文件或私人信息。
+    validations:
+      required: true

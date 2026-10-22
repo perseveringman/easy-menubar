@@ -1,0 +1,21 @@
+name: Build and test
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test preference parsing and state transitions
+        run: swift test --disable-sandbox
+      - name: Build universal application
+        run: BAR_CODESIGN_IDENTITY=- ./build.sh --universal
+      - name: Verify both architectures and signature
+        run: |
+          lipo Bar.app/Contents/MacOS/Bar -verify_arch arm64 x86_64
+          codesign --verify --deep --strict Bar.app
+          plutil -lint Bar.app/Contents/Info.plist

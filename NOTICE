@@ -1,0 +1,7 @@
+Bar — Copyright (C) 2026 Ryan Zhou
+Licensed under the GNU General Public License v3.0. See LICENSE.
+
+Research reference: Thaw, https://github.com/thaw-app/Thaw
+Thaw is distributed under GPL-3.0. Its source was consulted while researching
+macOS status-item preferences. The Thaw checkout, assets, binaries and branding
+are not bundled in Bar. Bar is not affiliated with or endorsed by Thaw.
