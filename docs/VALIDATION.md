@@ -47,6 +47,16 @@
 - GitHub 下载 ZIP 解压后的应用通过签名、装订票据与分发策略检查。
 - 对外素材：`press/bar-card.png`（1600 × 1000）及可编辑 SVG、`press/announcement.md`。
 
+## 项目介绍上线
+
+- 介绍页：<https://www.zyb.world/project/bar>，源代码提交 `6293f167ba4f11e97743eaaa6cb653ff08c999e5` 已推送至 zybworld。
+- 本地构建、TypeScript 类型检查、8 项部署契约测试均通过；390px 与 1280px 画廊/页面没有横向溢出，图片放大、方向键与关闭交互验证通过。
+- Mac mini 在部署工具安装阶段离线，尚未上传文件；使用项目原有 GitHub 云端备用执行器继续部署。
+- 云端部署运行 `39814963762` 的上传、CDN 刷新、生产 HTML 与图片检查步骤均成功。
+- 正式路由返回 HTTP 200，生产 bundle `index-Drgv6z4v.js` 含 Bar 文案和下载入口，三张实际展示图均返回 200 与图像内容类型。
+- Chrome 实际访问正式页面，标题、介绍、画廊图片和 GitHub 下载入口呈现正确。
+- zybworld 原有 Honie、Pebble 与其他正在编辑内容保持原状，仅提交 Bar 项目及三张素材。
+
 ## 已知验收边界
 
 - 已交叉编译 Intel 切片，尚未在 Intel 硬件运行验收。
