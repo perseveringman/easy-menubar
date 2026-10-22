@@ -12,4 +12,4 @@ Bar 适用于 macOS 26 及更新系统。它依赖应用保存的状态栏偏好
 
 源码与下载：https://github.com/perseveringman/easy-menubar
 
-配图：`bar-card.svg`（由实际运行截图排版），原始截图见 `../screenshot.png` 与 `../search.png`。
+配图：`bar-card.png`（1600 × 1000，可直接发布）与 `bar-card.svg`（由实际运行截图排版），原始截图见 `../screenshot.png` 与 `../search.png`。

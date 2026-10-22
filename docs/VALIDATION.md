@@ -37,6 +37,16 @@
 - `spctl` 返回 Notarized Developer ID。本机既有 Gatekeeper 总开关为 assessments disabled，因此该返回值**不等于**在默认开启 Gatekeeper 的全新 Mac 上完成首次下载放行验证。验收过程没有修改该开关。
 - 校验值与公证原始报告见 `evidence/`。
 
+## GitHub 交付
+
+- 正式版：<https://github.com/perseveringman/easy-menubar/releases/tag/v1.0.0>。
+- 发布源码 tag 对应 `273ed2c952a62bc6cb223e2d30782db7f390c9f5`。
+- GitHub CI 运行 `39814058926` 已完成并成功：6 项测试、通用构建、双架构与签名检查均通过。
+- 从 GitHub 草稿下载 ZIP 与 DMG，两者 SHA-256 与上传前一致。
+- 从公开下载地址使用不带认证的 HTTPS 请求取得 ZIP，SHA-256 与发布校验文件一致。
+- GitHub 下载 ZIP 解压后的应用通过签名、装订票据与分发策略检查。
+- 对外素材：`press/bar-card.png`（1600 × 1000）及可编辑 SVG、`press/announcement.md`。
+
 ## 已知验收边界
 
 - 已交叉编译 Intel 切片，尚未在 Intel 硬件运行验收。
