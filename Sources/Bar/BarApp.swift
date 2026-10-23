@@ -50,8 +50,9 @@ struct BarApp: App {
     }
 }
 
-/// Workspace/focus events are sufficient. There are no timers or periodic
-/// permission checks while this app waits in the menu bar.
+/// Workspace/focus events handle normal changes. A lightweight window check
+/// fills notification gaps only while our window is foreground; no periodic
+/// scans or permission checks run while Bar waits closed in the menu bar.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
@@ -59,12 +60,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var observations: [(NotificationCenter, NSObjectProtocol)] = []
     private var refreshTask: Task<Void, Never>?
+    private var visibleInventoryTask: Task<Void, Never>?
     private var hasLaunched = false
     private var didPresentWindow = false
 
     func bind(_ model: StatusItemModel) {
         self.model = model
         startIfNeeded()
+        startVisibleInventoryChecks()
     }
 
     func attachWindow(_ window: NSWindow?) {
@@ -74,13 +77,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.setFrameAutosaveName("BarMainWindow")
         observe(NSWindow.didBecomeKeyNotification, object: window) { [weak self] _ in
             self?.requestRefresh()
+            self?.startVisibleInventoryChecks()
+        }
+        observe(NSWindow.didResignKeyNotification, object: window) { [weak self] _ in
+            self?.stopVisibleInventoryChecks()
         }
         observe(NSWindow.willCloseNotification, object: window) { [weak self] _ in
             self?.refreshTask?.cancel()
+            self?.stopVisibleInventoryChecks()
             self?.model?.dismissStatus()
         }
         observe(NSWindow.didMiniaturizeNotification, object: window) { [weak self] _ in
             self?.refreshTask?.cancel()
+            self?.stopVisibleInventoryChecks()
         }
         observe(NSWindow.didDeminiaturizeNotification, object: window) { [weak self] _ in
             self?.requestRefresh()
@@ -113,6 +122,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         observe(NSWorkspace.didWakeNotification, center: workspace) { [weak self] _ in
+            self?.model?.applicationChanged(bundleID: nil)
+            self?.requestRefresh(force: true)
+        }
+        observe(NSWorkspace.activeSpaceDidChangeNotification, center: workspace) { [weak self] _ in
+            self?.model?.applicationChanged(bundleID: nil)
+            self?.requestRefresh(force: true)
+        }
+        observe(NSApplication.didChangeScreenParametersNotification) { [weak self] _ in
             self?.model?.applicationChanged(bundleID: nil)
             self?.requestRefresh(force: true)
         }
@@ -156,8 +173,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func startVisibleInventoryChecks() {
+        guard let window, window.isVisible, window.isKeyWindow, !window.isMiniaturized, let model else { return }
+        visibleInventoryTask?.cancel()
+        visibleInventoryTask = Task { [weak self, weak model] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(3)) } catch { return }
+                guard let self, let model, let window = self.window,
+                      window.isVisible, window.isKeyWindow, !window.isMiniaturized else { return }
+                await model.refreshIfMenuBarChanged()
+            }
+        }
+    }
+
+    private func stopVisibleInventoryChecks() {
+        visibleInventoryTask?.cancel()
+        visibleInventoryTask = nil
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         refreshTask?.cancel()
+        stopVisibleInventoryChecks()
         for (center, token) in observations { center.removeObserver(token) }
     }
 
@@ -179,6 +215,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         requestRefresh()
+        startVisibleInventoryChecks()
     }
 
     @objc private func handleStatusItemClick(_ sender: NSStatusBarButton) {

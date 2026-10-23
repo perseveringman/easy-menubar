@@ -26,20 +26,20 @@ final class PreferenceTests: XCTestCase {
 
 final class ModelTests: XCTestCase {
     @MainActor
-    func testInactiveHiddenAndPendingItemsAppearInOneSection() {
+    func testStoredSettingsAreSeparateFromCurrentIconsIncludingPendingChanges() {
         let states: [StatusItemModel.Entry.State] = [.shown, .hiding, .hidden, .showing, .inactiveVisible, .inactiveHidden]
         let entries = states.enumerated().map { index, state in
             StatusItemModel.Entry(id: "item-\(index)", bundleID: "test.bar", appName: "Test", autosaveName: "item-\(index)", displayName: "Test", state: state, isSystemOwned: false, icon: nil, isRunning: index < 4, order: nil, axName: "", isManageable: true)
         }
-        let model = StatusItemModel(entries: entries)
+        let model = StatusItemModel(entries: Array(entries.prefix(4)), storedEntries: Array(entries.suffix(2)))
         let allSections = model.shownEntries + model.hiddenEntries + model.inactiveEntries + model.unmanagedEntries
         XCTAssertEqual(allSections.count, entries.count)
         XCTAssertEqual(Set(allSections.map(\.id)).count, entries.count)
         XCTAssertTrue(model.hasHiddenItems)
-        let inactiveOnly = StatusItemModel(entries: [entries.last!])
+        let inactiveOnly = StatusItemModel(storedEntries: [entries.last!])
         XCTAssertTrue(inactiveOnly.hasHiddenItems, "Restore all must remain available for stopped apps")
-        XCTAssertEqual(inactiveOnly.hiddenEntries.count, 1)
-        XCTAssertTrue(inactiveOnly.inactiveEntries.isEmpty)
+        XCTAssertTrue(inactiveOnly.hiddenEntries.isEmpty, "A stopped app's preference is not a current hidden icon")
+        XCTAssertEqual(inactiveOnly.inactiveEntries.count, 1)
     }
 
     @MainActor
@@ -81,11 +81,26 @@ final class ModelTests: XCTestCase {
     }
 
     @MainActor
+    func testPartialLiveIconsCannotBeMatchedToOldPositionRecords() {
+        let model = StatusItemModel()
+        let records = [
+            StatusItemPreferences.Record(autosaveName: "Clock", isVisible: true, position: 200),
+            StatusItemPreferences.Record(autosaveName: "Focus", isVisible: true, position: 100),
+        ]
+        let ax = [AXStatusItem(name: "Focus on screen", frame: CGRect(x: 10, y: 0, width: 20, height: 24))]
+        let entries = model.entries(bundleID: "test.multiple", appName: "Utility", icon: nil,
+            isSystemOwned: false, isRunning: true, records: records, axItems: ax, isReadable: true)
+        XCTAssertEqual(entries.map(\.displayName), ["Utility · Clock", "Utility · Focus"])
+        XCTAssertTrue(entries.allSatisfy { $0.observedVisible == nil }, "Missing live items make positional matching ambiguous")
+        XCTAssertTrue(entries.allSatisfy { $0.axName.isEmpty })
+    }
+
+    @MainActor
     func testSearchMatchesOwnerAndTrimsWhitespace() {
         let model = StatusItemModel()
-        let records = [StatusItemPreferences.Record(autosaveName: "main", isVisible: true, position: 0)]
+        let records = [StatusItemPreferences.Record(autosaveName: "main", isVisible: false, position: 0)]
         let entries = model.entries(bundleID: "test.bar", appName: "Rectangle", icon: nil, isSystemOwned: false, isRunning: false, records: records, axItems: [], isReadable: false)
-        let searchable = StatusItemModel(entries: entries)
+        let searchable = StatusItemModel(storedEntries: entries)
         searchable.searchText = "  rectangle  "
         XCTAssertEqual(searchable.filteredInactiveEntries.count, 1)
         searchable.searchText = "missing"

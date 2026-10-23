@@ -4,7 +4,12 @@
 //
 //  Owns the list of menu bar items and the hide/show operations.
 //
-//  Two different things are tracked for every item:
+//  The primary list is generated from live WindowServer items, with AX used
+//  to identify their creators. Old hidden preference records live separately
+//  so they remain recoverable without becoming fictitious current icons.
+//
+//  The legacy visibility writer is retained during the engine migration.
+//  Two different things are tracked for a uniquely associated legacy item:
 //
 //  * whether the icon is in the menu bar right now, and
 //  * whether macOS has been told to keep it out.
@@ -69,8 +74,11 @@ final class StatusItemModel {
         /// `false` when macOS keeps no key for the item, so there is nothing
         /// to write and the item can only be listed.
         var isManageable: Bool
-        /// Nil means optional Accessibility access could not observe this owner.
+        /// Nil means the owner could not be observed, not that it has no icons.
         var observedVisible: Bool? = nil
+        /// Runtime identity is separate from a legacy preference identity.
+        var windowID: CGWindowID? = nil
+        var preferenceID: String { bundleID + "/" + autosaveName }
 
         /// `true` when the icon is on screen right now.
         var isOnScreen: Bool {
@@ -89,8 +97,12 @@ final class StatusItemModel {
     }
 
     private(set) var entries: [Entry] = []
-    init(entries: [Entry] = [], defaults: UserDefaults = .standard) {
+    /// Old hidden preferences remain recoverable without masquerading as icons.
+    private(set) var storedEntries: [Entry] = []
+    private(set) var inventoryError: String?
+    init(entries: [Entry] = [], storedEntries: [Entry] = [], defaults: UserDefaults = .standard) {
         self.entries = entries
+        self.storedEntries = storedEntries
         self.defaults = defaults
         if let data = defaults.data(forKey: Self.pendingKey),
            let saved = try? JSONDecoder().decode([String: PendingChange].self, from: data) {
@@ -110,6 +122,7 @@ final class StatusItemModel {
     private(set) var sandboxReadNote: String?
     @ObservationIgnored private var refreshAgain = false
     @ObservationIgnored private var lastRefresh: Date?
+    @ObservationIgnored private var lastWindowInventory: [MenuBarWindow]?
     private struct PendingChange: Codable {
         let visible: Bool
         let pid: pid_t
@@ -136,26 +149,25 @@ final class StatusItemModel {
 
     var searchText = ""
 
-    /// `true` when the app can read other apps' menus for nicer labels.
+    /// Required for reliable creator resolution before entering the live list.
     private(set) var hasAccessibilityAccess = false
 
     // MARK: - Presentation
 
     var shownEntries: [Entry] {
-        entries.filter { $0.isManageable && $0.isRunning && $0.isConfiguredVisible }
+        entries.filter { !$0.isSystemOwned && $0.isRunning && $0.isOnScreen }
     }
 
-    // Hidden settings remain reachable even after their owner exits.
     var hiddenEntries: [Entry] {
-        entries.filter { $0.isManageable && !$0.isConfiguredVisible }
+        entries.filter { !$0.isSystemOwned && $0.isRunning && !$0.isOnScreen }
     }
 
     var inactiveEntries: [Entry] {
-        entries.filter { $0.isManageable && !$0.isRunning && $0.isConfiguredVisible }
+        storedEntries
     }
 
     var unmanagedEntries: [Entry] {
-        entries.filter { !$0.isManageable && $0.isRunning }
+        entries.filter { $0.isSystemOwned && $0.isRunning }
     }
 
     var filteredShownEntries: [Entry] { filter(shownEntries) }
@@ -167,7 +179,9 @@ final class StatusItemModel {
         !(filteredShownEntries.isEmpty && filteredHiddenEntries.isEmpty
           && filteredInactiveEntries.isEmpty && filteredUnmanagedEntries.isEmpty)
     }
-    var hasHiddenItems: Bool { !hiddenEntries.isEmpty }
+    var hasHiddenItems: Bool {
+        (entries + storedEntries).contains { $0.isManageable && !$0.isConfiguredVisible }
+    }
     var isBusy: Bool { !pendingIDs.isEmpty }
     var manageableCount: Int { entries.filter(\.isManageable).count }
     private(set) var statusIsError = false
@@ -236,9 +250,12 @@ final class StatusItemModel {
         }
         let preferenceRecords = preferences.records
         guard !Task.isCancelled else { return }
-        let accessibility = authorized
-            ? await StatusItemScanner.accessibility(for: currentTargets)
-            : [:]
+        let ownTarget = AppScanTarget(bundleID: ownBundleID, processIdentifier: ProcessInfo.processInfo.processIdentifier,
+                                      localizedName: "Bar")
+        let live = authorized ? await MenuBarInventoryReader.read(targets: currentTargets + [ownTarget]) : nil
+        let accessibility: [String: AXStatus]
+        if case let .success(inventory) = live { accessibility = inventory.accessibility }
+        else { accessibility = [:] }
         guard !Task.isCancelled else { return }
         for id in preferenceRecords.keys where targets[id] == nil {
             targets[id] = AppScanTarget(bundleID: id, processIdentifier: nil, localizedName: nil)
@@ -287,7 +304,29 @@ final class StatusItemModel {
         }
         let collectedIDs = Set(collected.map(\.id))
         pendingChanges = pendingChanges.filter { collectedIDs.contains($0.key) }
-        let rebuilt = disambiguate(collected.sorted { lhs, rhs in
+        guard authorized else {
+            entries = []
+            storedEntries = collected.filter { $0.isManageable && (!$0.isConfiguredVisible || $0.isPending) }
+            inventoryError = nil
+            lastRefresh = Date()
+            return
+        }
+        guard case let .success(inventory) = live else {
+            inventoryError = "暂时无法读取当前菜单栏。请刷新重试。"
+            lastRefresh = nil
+            return
+        }
+        inventoryError = nil
+        lastWindowInventory = inventory.windows
+        let processes = runningByBundleID.values.compactMap { app -> MenuBarProcess? in
+            guard let id = app.bundleIdentifier else { return nil }
+            return MenuBarProcess(pid: app.processIdentifier, bundleID: id, name: app.localizedName ?? id)
+        } + [MenuBarProcess(pid: ProcessInfo.processInfo.processIdentifier, bundleID: ownBundleID, name: "Bar")]
+        let resolved = MenuBarWindowScanner.resolve(inventory.windows, processes: processes, accessibility: accessibility)
+            .filter { $0.source?.bundleID != ownBundleID }
+        let projected = makeLiveEntries(resolved, records: preferenceRecords, legacy: collected)
+        storedEntries = projected.stored
+        let rebuilt = disambiguate(projected.current.sorted { lhs, rhs in
             let byName = lhs.appName.localizedStandardCompare(rhs.appName)
             if byName != .orderedSame { return byName == .orderedAscending }
             return lhs.id < rhs.id
@@ -300,6 +339,37 @@ final class StatusItemModel {
         Self.logger.debug("scan seconds=\(self.lastScanSeconds, privacy: .public) reads=\(preferences.filesRead, privacy: .public) cacheHits=\(preferences.cacheHits, privacy: .public) AX=\(authorized, privacy: .public)")
     }
 
+    func makeLiveEntries(_ resolved: [ResolvedMenuBarWindow], records: [String: [StatusItemPreferences.Record]],
+                         legacy: [Entry]) -> (current: [Entry], stored: [Entry]) {
+        var represented = Set<String>()
+        let current = resolved.map { item -> Entry in
+            let source = item.source
+            let id = source?.bundleID ?? "unknown"
+            let name = source?.name ?? "未识别图标"
+            let record = MenuBarWindowScanner.matchingRecord(for: item, siblings: resolved, records: records[id] ?? [])
+            let legacyID = record.map { id + "/" + $0.autosaveName }
+            let previous = legacy.first { $0.id == legacyID }
+            let onScreen = item.window.isOnScreen
+            // Offscreen rows are readonly until the move engine is ready.
+            // They must not consume the separate legacy restore action.
+            if let legacyID, onScreen { represented.insert(legacyID) }
+            let state: Entry.State = onScreen
+                ? (record?.isVisible == false ? .hiding : .shown)
+                : (previous?.state == .showing ? .showing : .hidden)
+            return Entry(id: "window-\(item.window.hostPID)-\(item.window.id)", bundleID: id, appName: name,
+                autosaveName: record?.autosaveName ?? "",
+                displayName: displayName(axName: item.accessibleName, appName: name), state: state,
+                isSystemOwned: id.hasPrefix("com.apple."), icon: source.flatMap { icon(bundleID: $0.bundleID) },
+                isRunning: true, order: Int(item.window.frame.minX), axName: item.accessibleName,
+                isManageable: record != nil && source != nil && !id.hasPrefix("com.apple.") && onScreen,
+                observedVisible: onScreen, windowID: item.window.id)
+        }
+        let stored = legacy.filter {
+            $0.isManageable && !represented.contains($0.id) && (!$0.isConfiguredVisible || $0.isPending)
+        }.sorted { $0.appName.localizedStandardCompare($1.appName) == .orderedAscending }
+        return (current, stored)
+    }
+
     func rescan() async {
         await scanner.invalidate()
         missingApps.removeAll()
@@ -308,6 +378,17 @@ final class StatusItemModel {
         iconCache.removeAll(keepingCapacity: true)
         await refresh(force: true)
         if sandboxEnabled { readSandboxPreferences() }
+    }
+
+    /// Some hosted items appear/disappear without a workspace notification
+    /// (including a process terminated outside AppKit). The delegate calls
+    /// this only while our window is foreground; unchanged windows need no AX
+    /// or preference reread.
+    func refreshIfMenuBarChanged() async {
+        guard hasAccessibilityAccess, !isRefreshing, !isBusy else { return }
+        let snapshot = await MenuBarWindowScanner.snapshot()
+        if case let .success(windows) = snapshot, windows == lastWindowInventory { return }
+        await refresh(force: true)
     }
 
     func readSandboxPreferences() {
@@ -393,8 +474,11 @@ final class StatusItemModel {
         }
 
         let positions = Set(ordered.map(\.position))
+        // A partial live row does not tell which historical records remain.
+        // Matching its first icon to the first saved position can name the
+        // wrong writable setting, even when every saved position is unique.
         let canAssociate = ordered.count == 1 && axItems.count <= 1
-            || (!ordered.isEmpty && ordered.allSatisfy(\.hasKnownPosition) && positions.count == ordered.count && axItems.count <= ordered.count)
+            || (!ordered.isEmpty && ordered.allSatisfy(\.hasKnownPosition) && positions.count == ordered.count && axItems.count == ordered.count)
         var onScreen = axItems
         var visibleLeft = ordered.filter(\.isVisible).count
         var result: [Entry] = []
@@ -461,7 +545,10 @@ final class StatusItemModel {
                 result.axName = ""
                 result.order = nil
             }
-            result.observedVisible = isRunning ? (isReadable && (canAssociate || !entry.isManageable) ? result.order != nil : nil) : false
+            result.observedVisible = isRunning
+                ? (isReadable && axItems.isEmpty ? false
+                    : (isReadable && (canAssociate || !entry.isManageable) ? result.order != nil : nil))
+                : false
             return result
         }
     }
@@ -532,7 +619,13 @@ final class StatusItemModel {
 
     /// Saves an item's visibility and restarts its owner only when safe.
     func setVisible(_ visible: Bool, for entry: Entry) async {
-        guard entry.isManageable, !entry.isSystemOwned, !entry.autosaveName.isEmpty, pendingIDs.isEmpty, !isRefreshing else { return }
+        guard hasAccessibilityAccess, entry.isManageable, !entry.isSystemOwned, !entry.autosaveName.isEmpty,
+              pendingIDs.isEmpty, !isRefreshing else { return }
+        if let windowID = entry.windowID, MenuBarWindowScanner.frame(of: windowID) == nil {
+            statusMessage = "这个图标已经离开菜单栏，正在更新列表。"
+            await refresh(force: true)
+            return
+        }
         pendingIDs.insert(entry.id)
         dismissStatus()
         defer { pendingIDs.remove(entry.id) }
@@ -547,10 +640,10 @@ final class StatusItemModel {
         }
 
         if let app = runningApplication(bundleID: entry.bundleID) {
-            pendingChanges[entry.id] = PendingChange(visible: visible, pid: app.processIdentifier, launchedAt: app.launchDate)
+            pendingChanges[entry.preferenceID] = PendingChange(visible: visible, pid: app.processIdentifier, launchedAt: app.launchDate)
         }
         if visible {
-            removeRemembered(entry.id)
+            removeRemembered(entry.preferenceID)
         } else {
             remember(entry)
         }
@@ -628,8 +721,8 @@ final class StatusItemModel {
 
     /// Shows every hidden item at once.
     func showAll() async {
-        let hidden = hiddenEntries.filter { !$0.isSystemOwned }
-        guard pendingIDs.isEmpty, !isRefreshing, !hidden.isEmpty else { return }
+        let hidden = (entries + storedEntries).filter { $0.isManageable && !$0.isSystemOwned && !$0.isConfiguredVisible }
+        guard hasAccessibilityAccess, pendingIDs.isEmpty, !isRefreshing, !hidden.isEmpty else { return }
         for entry in hidden { pendingIDs.insert(entry.id) }
         defer { pendingIDs.removeAll() }
 
@@ -637,9 +730,9 @@ final class StatusItemModel {
         var failed: [Entry] = []
         for entry in hidden {
             if await writeVisibility(true, for: entry) {
-                removeRemembered(entry.id)
+                removeRemembered(entry.preferenceID)
                 if let app = runningApplication(bundleID: entry.bundleID) {
-                    pendingChanges[entry.id] = PendingChange(visible: true, pid: app.processIdentifier, launchedAt: app.launchDate)
+                    pendingChanges[entry.preferenceID] = PendingChange(visible: true, pid: app.processIdentifier, launchedAt: app.launchDate)
                 }
                 changed.append(entry)
             } else {
@@ -698,7 +791,7 @@ final class StatusItemModel {
 
     private func remember(_ entry: Entry) {
         var remembered = Self.rememberedHiddenItems
-        guard !remembered.contains(where: { $0.id == entry.id }) else { return }
+        guard !remembered.contains(where: { $0.id == entry.preferenceID }) else { return }
         remembered.append(entry)
         if let data = try? JSONEncoder().encode(remembered.map(RememberedItem.init(entry:))) {
             UserDefaults.standard.set(data, forKey: Self.rememberedKey)
@@ -723,7 +816,7 @@ final class StatusItemModel {
         let order: Int?
 
         init(entry: Entry) {
-            id = entry.id
+            id = entry.preferenceID
             bundleID = entry.bundleID
             appName = entry.appName
             autosaveName = entry.autosaveName

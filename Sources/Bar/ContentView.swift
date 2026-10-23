@@ -11,6 +11,10 @@ struct ContentView: View {
     var body: some View {
         @Bindable var model = model
         VStack(spacing: 0) {
+            if !model.hasAccessibilityAccess {
+                AccessibilitySetupView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
                 TextField("搜索应用或图标", text: $model.searchText)
@@ -37,19 +41,19 @@ struct ContentView: View {
             List {
                 if !model.filteredHiddenEntries.isEmpty {
                     Section {
-                        ForEach(model.filteredHiddenEntries) { ItemRow(entry: $0) }
-                    } header: { SectionHeader(title: "隐藏", count: model.filteredHiddenEntries.count) }
+                        ForEach(model.filteredHiddenEntries) { entry in iconRow(entry) }
+                    } header: { SectionHeader(title: "未显示", count: model.filteredHiddenEntries.count) }
                 }
                 if !model.filteredShownEntries.isEmpty {
                     Section {
-                        ForEach(model.filteredShownEntries) { ItemRow(entry: $0) }
+                        ForEach(model.filteredShownEntries) { entry in iconRow(entry) }
                     } header: { SectionHeader(title: "显示", count: model.filteredShownEntries.count) }
                 }
                 if !model.filteredInactiveEntries.isEmpty {
                     DisclosureGroup(isExpanded: expanded($showsInactive)) {
-                        ForEach(model.filteredInactiveEntries) { ItemRow(entry: $0) }
+                        ForEach(model.filteredInactiveEntries) { StoredSettingRow(entry: $0) }
                     } label: {
-                        SectionHeader(title: "未运行的应用", count: model.filteredInactiveEntries.count)
+                        SectionHeader(title: "旧版隐藏设置", count: model.filteredInactiveEntries.count)
                     }
                     .padding(.vertical, 5)
                 }
@@ -57,7 +61,7 @@ struct ContentView: View {
                     DisclosureGroup(isExpanded: expanded($showsUnmanaged)) {
                         ForEach(model.filteredUnmanagedEntries) { UnmanagedRow(entry: $0) }
                     } label: {
-                        SectionHeader(title: "其他图标", count: model.filteredUnmanagedEntries.count)
+                        SectionHeader(title: "系统图标", count: model.filteredUnmanagedEntries.count)
                     }
                     .padding(.vertical, 5)
                 }
@@ -66,12 +70,23 @@ struct ContentView: View {
             .overlay {
                 if model.entries.isEmpty && model.isRefreshing {
                     ProgressView("正在读取菜单栏…").controlSize(.small)
+                } else if model.entries.isEmpty && model.inventoryError != nil {
+                    ContentUnavailableView("暂时无法读取菜单栏", systemImage: "exclamationmark.circle",
+                        description: Text("请刷新重试。历史设置不会作为当前图标显示。"))
                 } else if model.isSearching && !model.hasSearchResults {
                     ContentUnavailableView.search(text: model.searchText)
-                } else if model.entries.isEmpty {
+                } else if model.entries.isEmpty && model.storedEntries.isEmpty {
                     ContentUnavailableView("还没有可管理的图标", systemImage: "menubar.rectangle",
                         description: Text("打开一个带菜单栏图标的应用，再刷新列表。"))
                 }
+            }
+            }
+
+            if let error = model.inventoryError, !model.entries.isEmpty {
+                Label(error + " 当前保留上次列表。", systemImage: "exclamationmark.circle")
+                    .font(.caption).foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 14).padding(.vertical, 8)
             }
 
             if let message = model.statusMessage {
@@ -90,12 +105,9 @@ struct ContentView: View {
             Divider()
             HStack(spacing: 8) {
                 if !model.hasAccessibilityAccess {
-                    Button { showsHelp = true } label: {
-                        Label("更多图标与权限", systemImage: "info.circle")
-                    }
-                    .help("可选权限；不授权也可以管理已列出的图标")
+                    Text("需要辅助功能权限").foregroundStyle(.secondary)
                 } else {
-                    Text("\(model.manageableCount) 个可管理图标").foregroundStyle(.secondary)
+                    Text("当前 \(model.entries.count) 个图标").foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 4)
                 Button("退出 Bar") { NSApp.terminate(nil) }.help("退出 Bar（⌘Q）")
@@ -121,8 +133,8 @@ struct ContentView: View {
             }
             ToolbarItem(placement: .primaryAction) {
                 Menu {
-                    Button("全部显示", systemImage: "eye") { confirmsShowAll = true }
-                        .disabled(!model.hasHiddenItems || model.isBusy || model.isRefreshing)
+                    Button("恢复旧版隐藏设置…", systemImage: "eye") { confirmsShowAll = true }
+                        .disabled(!model.hasAccessibilityAccess || !model.hasHiddenItems || model.isBusy || model.isRefreshing)
                     Button("系统菜单栏设置…", systemImage: "menubar.rectangle") { openMenuBarSettings() }
                     Button("找回 Bar 图标", systemImage: "arrow.uturn.backward") {
                         NotificationCenter.default.post(name: .barRestoreMenuBarEntry, object: nil)
@@ -134,8 +146,8 @@ struct ContentView: View {
                 .accessibilityLabel("更多操作")
             }
         }
-        .confirmationDialog("显示所有已隐藏的图标？", isPresented: $confirmsShowAll) {
-            Button("全部显示") { Task { await model.showAll() } }
+        .confirmationDialog("恢复所有旧版隐藏设置？", isPresented: $confirmsShowAll) {
+            Button("恢复显示设置") { Task { await model.showAll() } }
             Button("取消", role: .cancel) {}
         } message: {
             Text("菜单栏工具会重新打开；其他应用的设置在下次打开时生效。")
@@ -144,8 +156,74 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .barFocusSearch)) { _ in searchFocused = true }
     }
 
+    @ViewBuilder
+    private func iconRow(_ entry: StatusItemModel.Entry) -> some View {
+        if entry.isManageable { ItemRow(entry: entry) }
+        else { UnmanagedRow(entry: entry) }
+    }
+
     private func expanded(_ stored: Binding<Bool>) -> Binding<Bool> {
         Binding(get: { model.isSearching || stored.wrappedValue }, set: { stored.wrappedValue = $0 })
+    }
+}
+
+private struct AccessibilitySetupView: View {
+    @Environment(StatusItemModel.self) private var model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Image(systemName: "menubar.rectangle").font(.system(size: 32)).foregroundStyle(.secondary)
+            Text("先连接你的菜单栏").font(.title2.weight(.semibold))
+            Text("允许辅助功能访问，让 Bar 识别当前图标的名称、位置和状态。")
+                .foregroundStyle(.secondary)
+            Text("在系统设置中找到 Bar，并打开旁边的开关。回来后会自动检查。")
+                .font(.callout)
+            Button("打开辅助功能设置…", action: openAccessibilitySettings)
+                .buttonStyle(.borderedProminent)
+            Button("已开启，重新检查") { Task { await model.refresh(force: true) } }
+                .buttonStyle(.plain).foregroundStyle(.secondary)
+                .disabled(model.isRefreshing)
+            Text("无需开启屏幕录制。权限由 macOS 管理，可随时关闭。")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .frame(maxWidth: 310, alignment: .leading).padding(28)
+    }
+}
+
+private struct StoredSettingRow: View {
+    let entry: StatusItemModel.Entry
+    @Environment(StatusItemModel.self) private var model
+    @State private var confirmsRestore = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            AppIconView(icon: entry.icon, fallback: entry.appName)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(entry.displayName).lineLimit(1).help(entry.displayName)
+                Text(entry.isPending ? "显示设置已保存，等待应用重新打开" : "保存的设置，当前未识别到对应图标")
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+            }
+            Spacer(minLength: 6)
+            if model.pendingIDs.contains(entry.id) {
+                ProgressView().controlSize(.small)
+            } else {
+                Button(entry.isPending ? "应用" : "恢复显示") { confirmsRestore = true }
+                    .controlSize(.small).disabled(model.isBusy || model.isRefreshing)
+            }
+        }
+        .padding(.vertical, 5)
+        .confirmationDialog(entry.isPending ? "重新打开「\(entry.appName)」？" : "恢复「\(entry.appName)」的显示设置？", isPresented: $confirmsRestore) {
+            Button(entry.isPending ? "重新打开" : "恢复显示设置") {
+                Task {
+                    if entry.isPending { await model.applyNow(for: entry) }
+                    else { await model.setVisible(true, for: entry) }
+                }
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("菜单栏工具会正常退出并重新打开。其他应用会保留运行，稍后重新打开时生效。请先保存工作。")
+        }
     }
 }
 
@@ -214,7 +292,7 @@ private struct UnmanagedRow: View {
             AppIconView(icon: entry.icon, fallback: entry.appName)
             VStack(alignment: .leading, spacing: 3) {
                 Text(entry.displayName).lineLimit(1)
-                Text(entry.isSystemOwned ? "由 macOS 管理" : "应用未提供可调整的图标设置")
+                Text(note)
                     .font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer(minLength: 6)
@@ -224,6 +302,13 @@ private struct UnmanagedRow: View {
                     .accessibilityLabel("在系统菜单栏设置中调整「\(entry.displayName)」")
             }
         }.padding(.vertical, 5)
+    }
+
+    private var note: String {
+        if entry.isSystemOwned { return "由 macOS 管理" }
+        if entry.bundleID == "unknown" { return "暂时无法确认所属应用" }
+        if entry.observedVisible == false { return "当前未显示在菜单栏上" }
+        return "暂时无法调整此图标"
     }
 }
 
@@ -261,15 +346,12 @@ private struct HelpView: View {
             Text("Bar 的眼睛图标启动时优先靠右显示。找不到时，可从窗口右上角的更多菜单选择“找回 Bar 图标”。")
                 .font(.caption).foregroundStyle(.secondary)
             Divider()
-            Text("更多图标信息 · 可选权限").font(.subheadline.weight(.medium))
-            Text("辅助功能权限用于读取图标名称、位置和显示状态。不授权也可以管理已列出的图标。")
+            Text("辅助功能权限").font(.subheadline.weight(.medium))
+            Text("用于识别当前菜单栏图标的名称、位置和状态。关闭权限后，Bar 会回到连接引导，不会把历史设置当作当前图标。")
                 .foregroundStyle(.secondary)
             if !model.hasAccessibilityAccess {
                 HStack {
-                    Button("打开辅助功能设置…") {
-                        AccessibilityScanner.requestAuthorization()
-                        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-                    }
+                    Button("打开辅助功能设置…", action: openAccessibilitySettings)
                     Button("重新检查") { Task { await model.refresh(force: true) } }
                 }
                 DisclosureGroup("已授权但仍未识别？") {
@@ -277,25 +359,30 @@ private struct HelpView: View {
                     Text(Bundle.main.bundleURL.path).textSelection(.enabled).font(.caption).foregroundStyle(.secondary)
                 }
             }
-            DisclosureGroup("找不到某个图标？") {
+            DisclosureGroup("恢复旧版隐藏设置") {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("有些应用的设置受 macOS 保护。继续查找时，系统可能询问“App 数据”访问。Bar 只保留菜单栏设置；拒绝不会影响其他图标。")
+                    Text("以前保存的隐藏设置会单独列出。有些旧设置受 macOS 保护，查找时可能询问“App 数据”访问。当前图标列表不需要读取这些数据。")
                         .font(.caption).foregroundStyle(.secondary)
                     if model.isReadingSandboxPreferences {
                         HStack { ProgressView().controlSize(.small); Text("正在读取，可能需要系统确认…").font(.caption) }
                     } else {
                         if let note = model.sandboxReadNote { Text(note).font(.caption).foregroundStyle(.secondary) }
-                        Button(model.hasReadSandboxPreferences ? "重新查找图标…" : "查找更多图标…") { model.readSandboxPreferences() }
+                        Button(model.hasReadSandboxPreferences ? "重新查找旧设置…" : "查找旧设置…") { model.readSandboxPreferences() }
                     }
                 }.padding(.top, 6)
             }
-            Text("系统图标在 macOS 设置中调整；没有可写设置的图标会列在“其他图标”中。关闭窗口后，点击菜单栏的 Bar 图标即可回来。")
+            Text("列表来自当前菜单栏窗口。系统图标在 macOS 设置中调整；暂时无法调整的项目仍会列出。关闭窗口后，点击菜单栏的 Bar 图标即可回来。")
                 .font(.caption).foregroundStyle(.secondary)
         }
         .font(.callout)
         .fixedSize(horizontal: false, vertical: true)
         .padding(20).frame(width: 370)
     }
+}
+
+private func openAccessibilitySettings() {
+    AccessibilityScanner.requestAuthorization()
+    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
 }
 
 private func openMenuBarSettings() {

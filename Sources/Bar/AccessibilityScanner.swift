@@ -6,9 +6,8 @@
 //
 //  The Accessibility API is the only place that ties a menu bar icon to the
 //  app that put it there, and it hands back a human readable name for each
-//  one. It is optional: without it the app still lists items (by app name)
-//  and can still hide them, because hiding goes through macOS's own
-//  preference keys rather than through the Accessibility API.
+//  one. The user journey requires authorization before showing the live list;
+//  old preference records cannot stand in for actual menu bar items.
 //
 
 import AppKit
@@ -19,6 +18,13 @@ struct AXStatusItem: Hashable, @unchecked Sendable {
     let name: String
     /// The item's position in the menu bar, in screen points.
     let frame: CGRect
+    let identifier: String
+
+    init(name: String, frame: CGRect, identifier: String = "") {
+        self.name = name
+        self.frame = frame
+        self.identifier = identifier
+    }
 }
 
 /// What the Accessibility API could tell us about one app.
@@ -93,7 +99,8 @@ enum AccessibilityScanner {
                 guard frame.width > 0, frame.height > 0 else { continue }
                 items.append(AXStatusItem(
                     name: itemName(extra),
-                    frame: frame
+                    frame: frame,
+                    identifier: string(extra, "AXIdentifier")
                 ))
             }
         }

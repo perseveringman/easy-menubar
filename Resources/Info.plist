@@ -21,7 +21,7 @@
 	<key>CFBundleShortVersionString</key>
 	<string>1.1.0</string>
 	<key>CFBundleVersion</key>
-	<string>2</string>
+	<string>3</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>26.0</string>
 	<key>LSUIElement</key>
@@ -29,7 +29,7 @@
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 	<key>NSAppDataUsageDescription</key>
-	<string>Bar 会读取其他应用沙盒容器中的偏好设置，用于列出和管理它们的菜单栏图标。</string>
+	<string>在你选择查找旧版隐藏设置时，Bar 会读取其他应用沙盒容器中的菜单栏偏好，以帮助恢复显示设置。</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSSupportsAutomaticTermination</key>

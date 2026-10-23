@@ -1,0 +1,46 @@
+{
+  "date": "2026-10-23",
+  "version": "1.1.0 development, build 3",
+  "evidence": "Observed through CUA in the installed Developer ID build; process existence checked separately with pgrep. Counts are observations, not an expected fixed menu bar size.",
+  "liveInventory": {
+    "observedCurrentWindowCountBeforeFixture": 22,
+    "legacyHiddenSettingsInSeparateDisclosure": 5,
+    "unresolvedUnlabelledItems": 2,
+    "unresolvedItemsAreReadonly": true
+  },
+  "unnamedFixture": {
+    "declaresAutosaveName": false,
+    "displayedAXLabel": "Audit",
+    "creatorResolved": false,
+    "listedAsAppleSystemItem": false,
+    "observedCurrentWindowCountWhileRunning": 23,
+    "normalQuitViaCUA": true,
+    "observedCurrentWindowCountAfterExit": 22,
+    "searchResultRemovedWithoutManualRefreshAfterForegroundCheckFix": true,
+    "testProcessesLeftRunning": false
+  },
+  "permissionOnboarding": {
+    "usesShippingContentView": true,
+    "defaultSizeLayoutObserved": true,
+    "minimumSizeLayoutVerified": false,
+    "installedBarsTCCGrantChangedForPreview": false,
+    "fullReauthorizationFlowVerified": false
+  },
+  "resources": {
+    "sampler": "Tools/measure-process.c",
+    "pid": 57752,
+    "foregroundSample": "1.1-window-inventory-foreground-idle.json",
+    "frontmostBundleIDBeforeAndAfterForegroundSample": "com.ryanbzhou.bar",
+    "closedWindowSample": "1.1-window-inventory-closed-idle.json",
+    "noCUAReadDuringClosedWindowSample": true,
+    "scope": "Measured the foreground-check implementation before the final legacy-recovery-only guard change. No claim about battery-life improvement or other machines."
+  },
+  "remaining": [
+    "Instant move and divider hide/show executor",
+    "Unresolved hosted ownership",
+    "Direct complete physical menu bar comparison",
+    "Full multi-display, Space and notch interaction matrix",
+    "Full real permission revoke and grant journey",
+    "Notarized 1.1 public release"
+  ]
+}
