@@ -182,6 +182,11 @@ private struct ItemRow: View {
         }
         .padding(.vertical, 5)
         .accessibilityElement(children: .contain)
+        .accessibilityActions {
+            if entry.isPending {
+                Button("重新打开「\(entry.appName)」以应用设置") { confirmsRestart = true }
+            }
+        }
         .confirmationDialog("重新打开「\(entry.appName)」？", isPresented: $confirmsRestart) {
             Button("重新打开") { Task { await model.applyNow(for: entry) } }
             Button("稍后", role: .cancel) {}
@@ -267,15 +272,15 @@ private struct HelpView: View {
                     Text(Bundle.main.bundleURL.path).textSelection(.enabled).font(.caption).foregroundStyle(.secondary)
                 }
             }
-            DisclosureGroup("沙盒应用的图标") {
+            DisclosureGroup("找不到某个图标？") {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("读取沙盒应用的偏好设置时，macOS 可能询问“App 数据”访问。这里只保留菜单栏设置；拒绝不会影响其他图标。")
+                    Text("有些应用的设置受 macOS 保护。继续查找时，系统可能询问“App 数据”访问。Bar 只保留菜单栏设置；拒绝不会影响其他图标。")
                         .font(.caption).foregroundStyle(.secondary)
                     if model.isReadingSandboxPreferences {
                         HStack { ProgressView().controlSize(.small); Text("正在读取，可能需要系统确认…").font(.caption) }
                     } else {
                         if let note = model.sandboxReadNote { Text(note).font(.caption).foregroundStyle(.secondary) }
-                        Button(model.hasReadSandboxPreferences ? "重新读取沙盒设置…" : "读取沙盒应用设置…") { model.readSandboxPreferences() }
+                        Button(model.hasReadSandboxPreferences ? "重新查找图标…" : "查找更多图标…") { model.readSandboxPreferences() }
                     }
                 }.padding(.top, 6)
             }
