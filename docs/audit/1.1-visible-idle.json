@@ -1,0 +1,11 @@
+{
+  "pid": 55885,
+  "elapsedSeconds": 20.002,
+  "cpuPercent": 0.0635,
+  "cpuMilliseconds": 12.71,
+  "physicalFootprintMiB": 50.673,
+  "residentMiB": 124.375,
+  "diskReadBytes": 0,
+  "diskWrittenBytes": 0,
+  "idleWakeups": 0
+}

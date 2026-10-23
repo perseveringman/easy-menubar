@@ -1,12 +1,9 @@
-//
-//  BarApp.swift
-//  Bar
-//
-//  A menu bar app that keeps one screen: the list of status bar items.
-//
-
 import AppKit
 import SwiftUI
+
+extension Notification.Name {
+    static let barFocusSearch = Notification.Name("BarFocusSearch")
+}
 
 @main
 struct BarApp: App {
@@ -14,20 +11,20 @@ struct BarApp: App {
     @State private var model = StatusItemModel()
 
     var body: some Scene {
-        Window("状态栏", id: "main") {
+        Window("Bar", id: "main") {
             ContentView()
                 .environment(model)
-                .background(WindowAccessor { window in delegate.window = window })
+                .background(WindowAccessor { delegate.attachWindow($0) })
                 .task {
+                    delegate.bind(model)
                     await model.refresh()
-                    delegate.model = model
                     delegate.updateStatusItemIcon(hasHidden: model.hasHiddenItems)
                 }
-                .onChange(of: model.hasHiddenItems) { _, hasHidden in
-                    delegate.updateStatusItemIcon(hasHidden: hasHidden)
+                .onChange(of: model.hasHiddenItems) { _, hidden in
+                    delegate.updateStatusItemIcon(hasHidden: hidden)
                 }
         }
-        .defaultSize(width: 480, height: 600)
+        .defaultSize(width: 480, height: 560)
         .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(replacing: .newItem) {}
@@ -40,93 +37,165 @@ struct BarApp: App {
                     ])
                 }
             }
+            CommandGroup(after: .textEditing) {
+                Button("搜索应用") { NotificationCenter.default.post(name: .barFocusSearch, object: nil) }
+                    .keyboardShortcut("f", modifiers: .command)
+            }
             CommandGroup(replacing: .appTermination) {
-                Button("退出 Bar") {
-                    NSApp.terminate(nil)
-                }
-                .keyboardShortcut("q", modifiers: .command)
+                Button("退出 Bar") { NSApp.terminate(nil) }
+                    .keyboardShortcut("q", modifiers: .command)
             }
         }
     }
 }
 
+/// Workspace/focus events are sufficient. There are no timers or periodic
+/// permission checks while this app waits in the menu bar.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    var window: NSWindow?
-    var model: StatusItemModel?
-
+    private var window: NSWindow?
+    private var model: StatusItemModel?
     private var statusItem: NSStatusItem?
+    private var observations: [(NotificationCenter, NSObjectProtocol)] = []
+    private var refreshTask: Task<Void, Never>?
+    private var hasLaunched = false
+    private var didPresentWindow = false
+
+    func bind(_ model: StatusItemModel) { self.model = model }
+
+    func attachWindow(_ window: NSWindow?) {
+        guard let window, self.window !== window else { return }
+        self.window = window
+        window.isReleasedWhenClosed = false
+        window.setFrameAutosaveName("BarMainWindow")
+        observe(NSWindow.didBecomeKeyNotification, object: window) { [weak self] _ in
+            self?.requestRefresh()
+        }
+        observe(NSWindow.willCloseNotification, object: window) { [weak self] _ in
+            self?.refreshTask?.cancel()
+            self?.model?.dismissStatus()
+        }
+        observe(NSWindow.didMiniaturizeNotification, object: window) { [weak self] _ in
+            self?.refreshTask?.cancel()
+        }
+        observe(NSWindow.didDeminiaturizeNotification, object: window) { [weak self] _ in
+            self?.requestRefresh()
+        }
+        if hasLaunched && !didPresentWindow { openWindow() }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        hasLaunched = true
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        item.button?.image = NSImage(systemSymbolName: "eye.slash", accessibilityDescription: "状态栏")
+        item.button?.image = NSImage(systemSymbolName: "eye.slash", accessibilityDescription: "Bar")
         item.button?.image?.isTemplate = true
         item.button?.target = self
         item.button?.action = #selector(handleStatusItemClick(_:))
         item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
-        item.button?.toolTip = "Bar · 点击打开，右键显示菜单"
+        item.button?.toolTip = "Bar · 显示或收起窗口，右键显示菜单"
         statusItem = item
 
-        // Bring the window forward the first time so the app explains itself.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-            self?.openWindow()
+        observe(NSApplication.didBecomeActiveNotification) { [weak self] _ in self?.requestRefresh() }
+        let workspace = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
+            observe(name, center: workspace) { [weak self] bundleID in
+                guard bundleID != Bundle.main.bundleIdentifier else { return }
+                self?.model?.applicationChanged(bundleID: bundleID)
+                self?.requestRefresh(force: true)
+            }
         }
+        observe(NSWorkspace.didWakeNotification, center: workspace) { [weak self] _ in
+            self?.model?.applicationChanged(bundleID: nil)
+            self?.requestRefresh(force: true)
+        }
+        if window != nil { openWindow() }
+    }
+
+    private func observe(_ name: Notification.Name, object: AnyObject? = nil,
+                         center: NotificationCenter = .default,
+                         action: @escaping @MainActor (String?) -> Void) {
+        let token = center.addObserver(forName: name, object: object, queue: .main) { notification in
+            let id = (notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier
+            MainActor.assumeIsolated { action(id) }
+        }
+        observations.append((center, token))
+    }
+
+    private func requestRefresh(force: Bool = false) {
+        guard let window, window.isVisible, !window.isMiniaturized, let model, !model.isBusy else { return }
+        refreshTask?.cancel()
+        refreshTask = Task { [weak self] in
+            do { try await Task.sleep(for: .milliseconds(180)) } catch { return }
+            guard let self, self.window?.isVisible == true else { return }
+            await model.refresh(force: force)
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        refreshTask?.cancel()
+        for (center, token) in observations { center.removeObserver(token) }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         openWindow()
         return true
     }
-
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        false
-    }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     func updateStatusItemIcon(hasHidden: Bool) {
-        let symbol = hasHidden ? "eye.slash.fill" : "eye.slash"
-        statusItem?.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "状态栏")
+        statusItem?.button?.image = NSImage(systemSymbolName: hasHidden ? "eye.slash.fill" : "eye.slash",
+                                           accessibilityDescription: "Bar")
         statusItem?.button?.image?.isTemplate = true
     }
 
     @objc private func openWindow() {
+        guard let window else { return }
+        didPresentWindow = true
         NSApp.activate(ignoringOtherApps: true)
-        window?.makeKeyAndOrderFront(nil)
+        window.makeKeyAndOrderFront(nil)
+        requestRefresh()
     }
 
     @objc private func handleStatusItemClick(_ sender: NSStatusBarButton) {
         let event = NSApp.currentEvent
-        guard event?.type == .rightMouseUp || event?.modifierFlags.contains(.control) == true else {
+        if event?.type == .rightMouseUp || event?.modifierFlags.contains(.control) == true {
+            guard let statusItem else { return }
+            let menu = NSMenu()
+            let open = menu.addItem(withTitle: "打开 Bar", action: #selector(openWindow), keyEquivalent: "")
+            open.target = self
+            menu.addItem(.separator())
+            menu.addItem(withTitle: "退出 Bar", action: #selector(quit), keyEquivalent: "q").target = self
+            statusItem.menu = menu
+            sender.performClick(nil)
+            statusItem.menu = nil
+        } else if window?.isKeyWindow == true, window?.isVisible == true {
+            window?.orderOut(nil)
+            refreshTask?.cancel()
+        } else {
             openWindow()
-            return
         }
-
-        guard let statusItem else { return }
-        let menu = NSMenu()
-        let openItem = menu.addItem(withTitle: "打开 Bar", action: #selector(openWindow), keyEquivalent: "")
-        openItem.target = self
-        menu.addItem(.separator())
-        let quitItem = menu.addItem(withTitle: "退出 Bar", action: #selector(quit), keyEquivalent: "q")
-        quitItem.target = self
-        statusItem.menu = menu
-        sender.performClick(nil)
-        statusItem.menu = nil
     }
 
-    @objc private func quit() {
-        NSApp.terminate(nil)
+    @objc private func quit() { NSApp.terminate(nil) }
+}
+
+struct WindowAccessor: NSViewRepresentable {
+    let onResolve: (NSWindow?) -> Void
+    func makeNSView(context: Context) -> WindowObserver {
+        let view = WindowObserver()
+        view.onResolve = onResolve
+        return view
+    }
+    func updateNSView(_ view: WindowObserver, context: Context) {
+        view.onResolve = onResolve
+        if let window = view.window { onResolve(window) }
     }
 }
 
-/// Hands the `NSWindow` that hosts the SwiftUI content to the app delegate,
-/// so the menu bar button can bring it forward.
-struct WindowAccessor: NSViewRepresentable {
-    let onResolve: (NSWindow?) -> Void
-
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView(frame: .zero)
-        DispatchQueue.main.async { onResolve(view.window) }
-        return view
+final class WindowObserver: NSView {
+    var onResolve: (NSWindow?) -> Void = { _ in }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        onResolve(window)
     }
-
-    func updateNSView(_ nsView: NSView, context: Context) {}
 }

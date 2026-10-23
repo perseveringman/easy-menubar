@@ -1,0 +1,17 @@
+{
+  "cachedColdMilliseconds": 21.829962730407715,
+  "cachedWarmMilliseconds": [
+    7.718920707702637,
+    7.265925407409668,
+    7.763981819152832
+  ],
+  "coldFilesRead": 291,
+  "domainCount": 35,
+  "legacyMilliseconds": [
+    234.3679666519165,
+    30.388951301574707,
+    29.07705307006836
+  ],
+  "sameNonAppleDomains": true,
+  "warmFilesRead": 0
+}

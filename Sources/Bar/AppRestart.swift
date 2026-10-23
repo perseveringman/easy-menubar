@@ -10,7 +10,6 @@
 //
 
 import AppKit
-import Darwin
 
 enum AppRestart {
     /// Quits the app and launches it again. Returns `false` when the app
@@ -18,21 +17,18 @@ enum AppRestart {
     @discardableResult
     static func restart(_ app: NSRunningApplication) async -> Bool {
         guard let bundleURL = app.bundleURL else { return false }
-        let pid = app.processIdentifier
-
-        app.terminate()
+        guard app.terminate() else { return false }
 
         // Wait for the app to actually go away before starting it again.
         var didExit = false
-        for _ in 0 ..< 30 {
-            if kill(pid, 0) != 0 {
+        for _ in 0 ..< 100 {
+            if app.isTerminated {
                 didExit = true
                 break
             }
-            try? await Task.sleep(for: .milliseconds(100))
+            do { try await Task.sleep(for: .milliseconds(100)) } catch { return false }
         }
         guard didExit else { return false }
-        try? await Task.sleep(for: .milliseconds(250))
 
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = false

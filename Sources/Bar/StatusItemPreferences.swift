@@ -13,13 +13,16 @@
 //  item is hosted by Control Center. Flipping it is how an item is hidden;
 //  the owner picks the change up the next time it builds its status item.
 //
+//  Preference discovery is handled by the cached scanner. Container reads
+//  are opt-in so an App Data decision never blocks the initial list.
+//
 //  Two wrinkles this type deals with:
 //
 //  * Sandboxed apps keep their preferences inside their container, so the
 //    plist has to be read from `~/Library/Containers/…` and written through
 //    `defaults`, which resolves the container for us.
-//  * `CFPreferences` cannot see a sandboxed app's domain at all, so the
-//    plist on disk is the source of truth.
+//  * Writes and read-back use the same bounded `defaults` domain resolver,
+//    instead of waiting on a protected container file after an action.
 //
 
 import Foundation
@@ -33,6 +36,7 @@ enum StatusItemPreferences {
         /// The position macOS remembers for the item, used to order items
         /// that belong to the same app.
         let position: Int
+        var hasKnownPosition = true
     }
 
     // MARK: - Keys
@@ -50,10 +54,6 @@ enum StatusItemPreferences {
     // MARK: - Reading
 
     /// Every status item the given app declares, with its current state.
-    static func records(for bundleID: String) -> [Record] {
-        records(in: preferences(for: bundleID))
-    }
-
     static func records(in preferences: [String: Any]) -> [Record] {
         var names: Set<String> = []
         for key in preferences.keys where autosaveName(in: key) != nil {
@@ -72,7 +72,8 @@ enum StatusItemPreferences {
             return Record(
                 autosaveName: name,
                 isVisible: isVisible,
-                position: position ?? 0
+                position: position ?? 0,
+                hasKnownPosition: position != nil
             )
         }
         .sorted { lhs, rhs in
@@ -82,41 +83,32 @@ enum StatusItemPreferences {
         }
     }
 
-    /// Finds preference domains outside the app's running-process list.
-    /// This includes apps that have quit but whose status-item settings are
-    /// still saved in the user's shared Preferences directory. Sandboxed
-    /// containers are intentionally read only for known/running owners so a
-    /// refresh does not walk into every other app's private container.
-    static func bundleIDsWithStatusItemsInSharedPreferences() -> Set<String> {
-        let directory = URL(fileURLWithPath: NSHomeDirectory())
-            .appending(path: "Library/Preferences")
-        guard let urls = try? FileManager.default.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        ) else { return [] }
-
-        return Set(urls.compactMap { url in
-            guard url.pathExtension == "plist",
-                  let data = try? Data(contentsOf: url),
-                  let dictionary = try? PropertyListSerialization.propertyList(
-                    from: data,
-                    options: [],
-                    format: nil
-                  ) as? [String: Any],
-                  dictionary.keys.contains(where: { autosaveName(in: $0) != nil })
-            else { return nil }
-
-            return url.deletingPathExtension().lastPathComponent
-        })
-    }
-
-    /// Returns the visibility flag currently stored for an item.
+    /// Read back using the same container-aware domain resolver as the write.
+    /// The helper is bounded, unlike opening a protected file while macOS
+    /// waits for an App Data decision.
     static func isVisible(autosaveName: String, bundleID: String) -> Bool? {
-        let preferences = preferences(for: bundleID)
-        return boolValue(visibilityPrefix + autosaveName, in: preferences)
-            ?? boolValue(visibleCCPrefix + autosaveName, in: preferences)
-            ?? boolValue(visiblePrefix + autosaveName, in: preferences)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")
+        process.arguments = ["read", bundleID, visibilityPrefix + autosaveName]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        let finished = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in finished.signal() }
+        do {
+            try process.run()
+            guard finished.wait(timeout: .now() + 3) == .success else {
+                if process.isRunning { process.terminate() }
+                return nil
+            }
+            guard process.terminationStatus == 0 else { return nil }
+            let value = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            switch value {
+            case "1", "true", "YES": return true
+            case "0", "false", "NO": return false
+            default: return nil
+            }
+        } catch { return nil }
     }
 
     /// The autosave name encoded in a `NSStatusItem …` key, if any.
@@ -139,6 +131,8 @@ enum StatusItemPreferences {
     /// make a successful write to the current key look like a failure.
     @discardableResult
     static func setVisible(_ visible: Bool, autosaveName: String, bundleID: String) -> Bool {
+        guard !autosaveName.isEmpty, !bundleID.isEmpty,
+              !bundleID.hasPrefix("com.apple."), !bundleID.contains("/") else { return false }
         let value = visible ? "true" : "false"
         guard runDefaults(key: visibilityPrefix + autosaveName, value: value, bundleID: bundleID) else {
             return false
@@ -157,45 +151,17 @@ enum StatusItemPreferences {
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         do {
+            let finished = DispatchSemaphore(value: 0)
+            process.terminationHandler = { _ in finished.signal() }
             try process.run()
-            process.waitUntilExit()
+            guard finished.wait(timeout: .now() + 3) == .success else {
+                if process.isRunning { process.terminate() }
+                return false
+            }
             return process.terminationStatus == 0
         } catch {
             return false
         }
-    }
-
-    // MARK: - Plumbing
-
-    /// The app's preferences, read from wherever it keeps them.
-    ///
-    /// Both places are read and merged, because either one can hold the
-    /// status item keys on its own:
-    ///
-    ///  * A sandboxed app keeps its preferences inside its container, so
-    ///    the keys land in `~/Library/Containers/…`.
-    ///  * Such an app often has a home plist as well, holding unrelated
-    ///    settings and no status item keys at all. Stopping at the first
-    ///    file that exists would miss the keys that live in the container.
-    ///
-    /// The container wins, because it is the app's real domain.
-    static func preferences(for bundleID: String) -> [String: Any] {
-        var merged: [String: Any] = [:]
-        for url in preferenceURLs(for: bundleID) {
-            guard let data = try? Data(contentsOf: url),
-                  let dictionary = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any]
-            else { continue }
-            for (key, value) in dictionary { merged[key] = value }
-        }
-        return merged
-    }
-
-    private static func preferenceURLs(for bundleID: String) -> [URL] {
-        let home = URL(fileURLWithPath: NSHomeDirectory())
-        return [
-            home.appending(path: "Library/Preferences/\(bundleID).plist"),
-            home.appending(path: "Library/Containers/\(bundleID)/Data/Library/Preferences/\(bundleID).plist"),
-        ]
     }
 
     private static func boolValue(_ key: String, in preferences: [String: Any]) -> Bool? {

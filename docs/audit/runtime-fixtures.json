@@ -1,0 +1,49 @@
+{
+  "date": "2026-10-23",
+  "accessibilityGranted": false,
+  "utility": {
+    "beforePID": 16690,
+    "hiddenPID": 17009,
+    "hiddenActualVisible": false,
+    "restored": {
+      "items": [
+        {
+          "name": "AuditItem",
+          "visible": true
+        }
+      ],
+      "kind": "utility",
+      "pid": 17044
+    }
+  },
+  "regular": {
+    "beforePID": 17151,
+    "afterConfirmedRestart": {
+      "pid": 17176,
+      "items": [
+        {
+          "visible": false,
+          "name": "AuditItem"
+        }
+      ],
+      "kind": "regular"
+    }
+  },
+  "refusing": {
+    "afterAttempt": {
+      "pid": 17870,
+      "items": [
+        {
+          "visible": true,
+          "name": "AuditItem"
+        }
+      ],
+      "kind": "refusing"
+    },
+    "originalPIDStillAlive": true
+  },
+  "notes": [
+    "Fixture state is reported by real NSStatusItem.isVisible after launch.",
+    "No visibility settings of user applications were changed."
+  ]
+}

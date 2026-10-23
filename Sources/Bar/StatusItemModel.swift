@@ -20,18 +20,7 @@
 
 import AppKit
 import Observation
-
-private struct AppScanTarget: Sendable {
-    let bundleID: String
-    let processIdentifier: pid_t?
-    let localizedName: String?
-}
-
-private struct AppScanResult: Sendable {
-    let target: AppScanTarget
-    let records: [StatusItemPreferences.Record]
-    let status: AXStatus
-}
+import OSLog
 
 @MainActor
 @Observable
@@ -80,6 +69,8 @@ final class StatusItemModel {
         /// `false` when macOS keeps no key for the item, so there is nothing
         /// to write and the item can only be listed.
         var isManageable: Bool
+        /// Nil means optional Accessibility access could not observe this owner.
+        var observedVisible: Bool? = nil
 
         /// `true` when the icon is on screen right now.
         var isOnScreen: Bool {
@@ -98,12 +89,46 @@ final class StatusItemModel {
     }
 
     private(set) var entries: [Entry] = []
-    init(entries: [Entry] = []) {
+    init(entries: [Entry] = [], defaults: UserDefaults = .standard) {
         self.entries = entries
+        self.defaults = defaults
+        if let data = defaults.data(forKey: Self.pendingKey),
+           let saved = try? JSONDecoder().decode([String: PendingChange].self, from: data) {
+            pendingChanges = saved
+        }
     }
 
     private(set) var isRefreshing = false
-    private var refreshGeneration: UInt64 = 0
+    @ObservationIgnored private let scanner = StatusItemScanner()
+    @ObservationIgnored private let sandboxScanner = StatusItemScanner()
+    @ObservationIgnored private var sandboxTask: Task<Void, Never>?
+    @ObservationIgnored private var sandboxPreferences: [String: [String: StatusPreferenceValue]] = [:]
+    @ObservationIgnored private var lastTargets: [AppScanTarget] = []
+    @ObservationIgnored private var sandboxEnabled = false
+    private(set) var isReadingSandboxPreferences = false
+    private(set) var hasReadSandboxPreferences = false
+    private(set) var sandboxReadNote: String?
+    @ObservationIgnored private var refreshAgain = false
+    @ObservationIgnored private var lastRefresh: Date?
+    private struct PendingChange: Codable {
+        let visible: Bool
+        let pid: pid_t
+        let launchedAt: Date?
+    }
+    private static let pendingKey = "pendingVisibilityChanges"
+    @ObservationIgnored private let defaults: UserDefaults
+    @ObservationIgnored private var pendingChanges: [String: PendingChange] = [:] {
+        didSet {
+            if let data = try? JSONEncoder().encode(pendingChanges) { defaults.set(data, forKey: Self.pendingKey) }
+        }
+    }
+    @ObservationIgnored private var appURLs: [String: URL] = [:]
+    @ObservationIgnored private var missingApps: Set<String> = []
+    @ObservationIgnored private var appNames: [String: String] = [:]
+    @ObservationIgnored private static let logger = Logger(subsystem: "com.ryanbzhou.bar", category: "scan")
+    private(set) var lastScanSeconds: TimeInterval = 0
+    private(set) var lastPreferenceReads = 0
+    private(set) var lastCacheHits = 0
     /// Entries whose change is still being applied by the system.
     private(set) var pendingIDs: Set<String> = []
     /// A short note about what just happened, shown under the list.
@@ -114,43 +139,40 @@ final class StatusItemModel {
     /// `true` when the app can read other apps' menus for nicer labels.
     private(set) var hasAccessibilityAccess = false
 
-    // MARK: - Derived state
+    // MARK: - Presentation
 
-    var onScreenEntries: [Entry] {
-        entries.filter(\.isOnScreen)
+    var shownEntries: [Entry] {
+        entries.filter { $0.isManageable && $0.isRunning && $0.isConfiguredVisible }
     }
 
-    var offScreenEntries: [Entry] {
-        entries.filter { $0.isRunning && !$0.isOnScreen && !$0.isConfiguredVisible && $0.isManageable }
+    // Hidden settings remain reachable even after their owner exits.
+    var hiddenEntries: [Entry] {
+        entries.filter { $0.isManageable && !$0.isConfiguredVisible }
     }
 
     var inactiveEntries: [Entry] {
-        entries.filter { !$0.isRunning }
+        entries.filter { $0.isManageable && !$0.isRunning && $0.isConfiguredVisible }
     }
 
-    var waitingToShowEntries: [Entry] {
-        entries.filter { $0.state == .showing }
+    var unmanagedEntries: [Entry] {
+        entries.filter { !$0.isManageable && $0.isRunning }
     }
 
-    var filteredOnScreenEntries: [Entry] {
-        filter(onScreenEntries)
+    var filteredShownEntries: [Entry] { filter(shownEntries) }
+    var filteredHiddenEntries: [Entry] { filter(hiddenEntries) }
+    var filteredInactiveEntries: [Entry] { filter(inactiveEntries) }
+    var filteredUnmanagedEntries: [Entry] { filter(unmanagedEntries) }
+    var isSearching: Bool { !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    var hasSearchResults: Bool {
+        !(filteredShownEntries.isEmpty && filteredHiddenEntries.isEmpty
+          && filteredInactiveEntries.isEmpty && filteredUnmanagedEntries.isEmpty)
     }
+    var hasHiddenItems: Bool { !hiddenEntries.isEmpty }
+    var isBusy: Bool { !pendingIDs.isEmpty }
+    var manageableCount: Int { entries.filter(\.isManageable).count }
+    private(set) var statusIsError = false
 
-    var filteredOffScreenEntries: [Entry] {
-        filter(offScreenEntries)
-    }
-
-    var filteredInactiveEntries: [Entry] {
-        filter(inactiveEntries)
-    }
-
-    var filteredWaitingToShowEntries: [Entry] {
-        filter(waitingToShowEntries)
-    }
-
-    var hasHiddenItems: Bool {
-        entries.contains { !$0.isConfiguredVisible && $0.isManageable }
-    }
+    func dismissStatus() { statusMessage = nil; statusIsError = false }
 
     private func filter(_ source: [Entry]) -> [Entry] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -163,112 +185,152 @@ final class StatusItemModel {
 
     // MARK: - Loading
 
-    func refresh() async {
-        refreshGeneration &+= 1
-        let generation = refreshGeneration
+    /// Focus changes share a fresh snapshot. An explicit refresh bypasses
+    /// this short cooldown, while concurrent refreshes never duplicate I/O.
+    func refresh(force: Bool = false) async {
+        guard !isRefreshing else {
+            refreshAgain = refreshAgain || force
+            return
+        }
+        let authorized = AccessibilityScanner.isAuthorized
+        let permissionChanged = authorized != hasAccessibilityAccess
+        guard force || permissionChanged || lastRefresh.map({ Date().timeIntervalSince($0) >= 5 }) != false else { return }
         isRefreshing = true
-        hasAccessibilityAccess = AccessibilityScanner.isAuthorized
+        hasAccessibilityAccess = authorized
+        let started = Date()
         defer {
-            if generation == refreshGeneration {
-                isRefreshing = false
-            }
+            isRefreshing = false
+            let repeatRequested = refreshAgain
+            refreshAgain = false
+            if repeatRequested && !Task.isCancelled { Task { await refresh(force: true) } }
         }
 
-        let runningApps = NSWorkspace.shared.runningApplications.filter {
-            $0.processIdentifier != ProcessInfo.processInfo.processIdentifier
-        }
+        let ownBundleID = Bundle.main.bundleIdentifier ?? "com.ryanbzhou.bar"
         var runningByBundleID: [String: NSRunningApplication] = [:]
         var targets: [String: AppScanTarget] = [:]
-        for app in runningApps {
-            guard let bundleID = app.bundleIdentifier else { continue }
-            runningByBundleID[bundleID] = app
-            targets[bundleID] = AppScanTarget(
-                bundleID: bundleID,
-                processIdentifier: app.processIdentifier,
-                localizedName: app.localizedName
-            )
+        for app in NSWorkspace.shared.runningApplications {
+            guard let id = app.bundleIdentifier, id != ownBundleID,
+                  app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { continue }
+            // Prefer the actual user-facing owner over a same-ID helper.
+            if let existing = runningByBundleID[id], existing.activationPolicy != .prohibited { continue }
+            runningByBundleID[id] = app
+            let systemHost = ["com.apple.controlcenter", "com.apple.systemuiserver", "com.apple.spotlight", "com.apple.textinputmenuagent"].contains(id.lowercased())
+            targets[id] = AppScanTarget(bundleID: id, processIdentifier: app.processIdentifier,
+                                       localizedName: app.localizedName,
+                                       readsAccessibility: app.activationPolicy != .prohibited || systemHost)
         }
-
-        let remembered = Self.rememberedHiddenItems
+        let remembered = Self.rememberedHiddenItems.filter { !$0.isSystemOwned && !$0.bundleID.hasPrefix("com.apple.") && $0.bundleID != ownBundleID }
         for item in remembered where targets[item.bundleID] == nil {
-            targets[item.bundleID] = AppScanTarget(
-                bundleID: item.bundleID,
-                processIdentifier: nil,
-                localizedName: item.appName
-            )
+            targets[item.bundleID] = AppScanTarget(bundleID: item.bundleID, processIdentifier: nil, localizedName: item.appName)
         }
-
-        // Scan persisted non-sandboxed preference domains as well as live
-        // apps. AX IPC and file reads run away from the main thread so a slow
-        // helper process cannot freeze the list or its progress indicators.
-        let runningTargets = Array(targets.values)
-        let scanResults = await Task.detached(priority: .utility) {
-            var allTargets = Dictionary(uniqueKeysWithValues: runningTargets.map { ($0.bundleID, $0) })
-            for bundleID in StatusItemPreferences.bundleIDsWithStatusItemsInSharedPreferences() {
-                if allTargets[bundleID] == nil {
-                    allTargets[bundleID] = AppScanTarget(
-                        bundleID: bundleID,
-                        processIdentifier: nil,
-                        localizedName: nil
-                    )
-                }
-            }
-
-            return allTargets.values.map { target in
-                let status = target.processIdentifier.map {
-                    AccessibilityScanner.status(forProcessIdentifier: $0)
-                } ?? AXStatus(items: [], isReadable: false)
-                return AppScanResult(
-                    target: target,
-                    records: StatusItemPreferences.records(for: target.bundleID),
-                    status: status
-                )
-            }
-        }.value
+        let currentTargets = Array(targets.values)
+        lastTargets = currentTargets
+        var preferences = await scanner.preferences(for: currentTargets, excluding: ownBundleID)
+        for (id, values) in sandboxPreferences {
+            preferences.dictionaries[id, default: [:]].merge(values) { _, containerValue in containerValue }
+        }
+        let preferenceRecords = preferences.records
+        guard !Task.isCancelled else { return }
+        let accessibility = authorized
+            ? await StatusItemScanner.accessibility(for: currentTargets)
+            : [:]
+        guard !Task.isCancelled else { return }
+        for id in preferenceRecords.keys where targets[id] == nil {
+            targets[id] = AppScanTarget(bundleID: id, processIdentifier: nil, localizedName: nil)
+        }
 
         var collected: [Entry] = []
-        for result in scanResults {
-            let target = result.target
-            let runningApp = runningByBundleID[target.bundleID]
-            let appName = runningApp?.localizedName
-                ?? target.localizedName
-                ?? installedAppName(bundleID: target.bundleID)
-            let appIcon = runningApp.map { icon(for: $0) } ?? icon(bundleID: target.bundleID)
-            let systemOwned = target.bundleID.hasPrefix("com.apple.")
-
-            collected.append(contentsOf: entries(
-                bundleID: target.bundleID,
-                appName: appName,
-                icon: appIcon,
-                isSystemOwned: systemOwned,
-                isRunning: runningApp != nil,
-                records: result.records,
-                axItems: result.status.items,
-                isReadable: result.status.isReadable
-            ))
+        let rememberedIDs = Set(remembered.map(\.id))
+        for target in targets.values {
+            let records = preferenceRecords[target.bundleID] ?? []
+            let status = accessibility[target.bundleID] ?? AXStatus(items: [], isReadable: false)
+            // Do not load names/icons for background processes with no items.
+            guard !records.isEmpty || !status.items.isEmpty else { continue }
+            let app = runningByBundleID[target.bundleID]
+            if app == nil, applicationURL(bundleID: target.bundleID) == nil,
+               !records.contains(where: { rememberedIDs.contains(target.bundleID + "/" + $0.autosaveName) }) {
+                continue // Old preferences for uninstalled apps are not a UI list.
+            }
+            let name = app?.localizedName ?? target.localizedName ?? installedAppName(bundleID: target.bundleID)
+            let image = app.map { icon(for: $0) } ?? icon(bundleID: target.bundleID)
+            collected.append(contentsOf: entries(bundleID: target.bundleID, appName: name, icon: image,
+                isSystemOwned: target.bundleID.hasPrefix("com.apple."), isRunning: app != nil,
+                records: records, axItems: status.items, isReadable: status.isReadable))
         }
-
-        // Preserve Bar-hidden items even when their preference file is no
-        // longer readable or their owner has removed the status item.
         for item in remembered where !collected.contains(where: { $0.id == item.id }) {
             var entry = item
             if let app = runningByBundleID[item.bundleID] {
                 entry.isRunning = true
                 entry.icon = icon(for: app)
-                if entry.state == .inactiveHidden { entry.state = .hidden }
+                entry.state = .hidden
             }
             collected.append(entry)
         }
-
-        guard generation == refreshGeneration else { return }
-        entries = disambiguate(collected.sorted { lhs, rhs in
-            switch (lhs.order, rhs.order) {
-            case let (l?, r?): l == r ? lhs.appName < rhs.appName : l < r
-            case (nil, nil): lhs.appName == rhs.appName ? lhs.id < rhs.id : lhs.appName.localizedStandardCompare(rhs.appName) == .orderedAscending
-            case (nil, _): false
-            case (_, nil): true
+        // With no AX permission a saved preference cannot prove that a running
+        // owner rebuilt its item. Keep explicit changes pending until restart.
+        for index in collected.indices {
+            let entry = collected[index]
+            guard let change = pendingChanges[entry.id] else { continue }
+            let owner = runningByBundleID[entry.bundleID]
+            if owner?.processIdentifier != change.pid || owner?.launchDate != change.launchedAt {
+                pendingChanges.removeValue(forKey: entry.id)
+            } else if entry.observedVisible == change.visible {
+                pendingChanges.removeValue(forKey: entry.id)
+            } else {
+                collected[index].state = change.visible ? .showing : .hiding
             }
+        }
+        let collectedIDs = Set(collected.map(\.id))
+        pendingChanges = pendingChanges.filter { collectedIDs.contains($0.key) }
+        let rebuilt = disambiguate(collected.sorted { lhs, rhs in
+            let byName = lhs.appName.localizedStandardCompare(rhs.appName)
+            if byName != .orderedSame { return byName == .orderedAscending }
+            return lhs.id < rhs.id
         })
+        if entries != rebuilt { entries = rebuilt }
+        lastRefresh = Date()
+        lastScanSeconds = Date().timeIntervalSince(started)
+        lastPreferenceReads = preferences.filesRead
+        lastCacheHits = preferences.cacheHits
+        Self.logger.debug("scan seconds=\(self.lastScanSeconds, privacy: .public) reads=\(preferences.filesRead, privacy: .public) cacheHits=\(preferences.cacheHits, privacy: .public) AX=\(authorized, privacy: .public)")
+    }
+
+    func rescan() async {
+        await scanner.invalidate()
+        missingApps.removeAll()
+        await refresh(force: true)
+        if sandboxEnabled { readSandboxPreferences() }
+    }
+
+    func readSandboxPreferences() {
+        guard !isReadingSandboxPreferences, !lastTargets.isEmpty else { return }
+        sandboxEnabled = true
+        isReadingSandboxPreferences = true
+        let targets = lastTargets
+        let ownID = Bundle.main.bundleIdentifier ?? "com.ryanbzhou.bar"
+        sandboxTask = Task { [weak self, sandboxScanner] in
+            let snapshot = await sandboxScanner.preferences(for: targets, excluding: ownID, includeContainers: true)
+            guard let self else { return }
+            self.sandboxPreferences = snapshot.containers
+            self.isReadingSandboxPreferences = false
+            self.hasReadSandboxPreferences = true
+            self.sandboxReadNote = snapshot.unreadableContainers > 0
+                ? "有 \(snapshot.unreadableContainers) 个应用暂时无法读取，可稍后重试。"
+                : "读取完成。没有可写图标设置的应用不会加入列表。"
+            await self.refresh(force: true)
+        }
+    }
+
+    func applicationChanged(bundleID: String?) {
+        if let bundleID {
+            missingApps.remove(bundleID)
+            appURLs.removeValue(forKey: bundleID)
+            appNames.removeValue(forKey: bundleID)
+            iconCache.removeValue(forKey: bundleID)
+        }
+        // The delegate batches workspace notifications, and only refreshes
+        // when the window is visible.
+        lastRefresh = nil
     }
 
     /// Builds the entries of one app.
@@ -296,9 +358,9 @@ final class StatusItemModel {
         // and left to System Settings.
         if isSystemOwned {
             guard isRunning else { return [] }
-            return axItems.map { axItem in
+            return axItems.enumerated().map { index, axItem in
                 Entry(
-                    id: "\(bundleID)/system/\(Int(axItem.frame.minX))",
+                    id: "\(bundleID)/system/\(index)",
                     bundleID: bundleID,
                     appName: appName,
                     autosaveName: "",
@@ -309,7 +371,8 @@ final class StatusItemModel {
                     isRunning: true,
                     order: Int(axItem.frame.minX),
                     axName: axItem.name,
-                    isManageable: false
+                    isManageable: false,
+                    observedVisible: true
                 )
             }
         }
@@ -321,6 +384,9 @@ final class StatusItemModel {
                 : lhs.position > rhs.position
         }
 
+        let positions = Set(ordered.map(\.position))
+        let canAssociate = ordered.count == 1 && axItems.count <= 1
+            || (!ordered.isEmpty && ordered.allSatisfy(\.hasKnownPosition) && positions.count == ordered.count && axItems.count <= ordered.count)
         var onScreen = axItems
         var visibleLeft = ordered.filter(\.isVisible).count
         var result: [Entry] = []
@@ -338,12 +404,6 @@ final class StatusItemModel {
                         for: record, axItem: nil, state: .inactiveVisible,
                         bundleID: bundleID, appName: appName, icon: icon, isRunning: false
                     ))
-                } else if isReadable {
-                    // macOS was told to show it, but the icon is not there.
-                    result.append(entry(
-                        for: record, axItem: nil, state: .showing,
-                        bundleID: bundleID, appName: appName, icon: icon, isRunning: true
-                    ))
                 } else {
                     // The app could not be read, so all that is known is
                     // what macOS was told.
@@ -356,7 +416,7 @@ final class StatusItemModel {
                 // macOS was told to hide it. When more icons sit in the bar
                 // than the visible records account for, this one is still
                 // there and its owner has yet to rebuild it.
-                let stillThere = isRunning && isReadable && !onScreen.isEmpty && onScreen.count > visibleLeft
+                let stillThere = isRunning && isReadable && canAssociate && !onScreen.isEmpty && onScreen.count > visibleLeft
                 result.append(entry(
                     for: record,
                     axItem: stillThere ? onScreen.removeFirst() : nil,
@@ -368,9 +428,9 @@ final class StatusItemModel {
 
         // Icons macOS keeps no settings for — the owner never gave its
         // status item an autosave name — can be listed but not hidden.
-        for axItem in onScreen {
+        for (index, axItem) in onScreen.enumerated() {
             result.append(Entry(
-                id: "\(bundleID)/#\(Int(axItem.frame.minX))",
+                id: "\(bundleID)/unnamed/\(index)",
                 bundleID: bundleID,
                 appName: appName,
                 autosaveName: "",
@@ -385,7 +445,17 @@ final class StatusItemModel {
             ))
         }
 
-        return result
+        return result.map { entry in
+            var result = entry
+            if entry.isManageable && !canAssociate, let index = ordered.firstIndex(where: { $0.autosaveName == entry.autosaveName }) {
+                let internalName = entry.autosaveName.range(of: #"^(?:Item|item|StatusItem|statusItem)[-_.0-9]*$"#, options: .regularExpression) != nil
+                result.displayName = internalName ? "\(appName) · 图标 \(index + 1)" : "\(appName) · \(entry.autosaveName)"
+                result.axName = ""
+                result.order = nil
+            }
+            result.observedVisible = isRunning ? (isReadable && (canAssociate || !entry.isManageable) ? result.order != nil : nil) : false
+            return result
+        }
     }
 
     private func entry(
@@ -454,19 +524,23 @@ final class StatusItemModel {
 
     /// Saves an item's visibility and restarts its owner only when safe.
     func setVisible(_ visible: Bool, for entry: Entry) async {
-        guard entry.isManageable, pendingIDs.isEmpty else { return }
+        guard entry.isManageable, !entry.isSystemOwned, !entry.autosaveName.isEmpty, pendingIDs.isEmpty, !isRefreshing else { return }
         pendingIDs.insert(entry.id)
-        statusMessage = nil
+        dismissStatus()
         defer { pendingIDs.remove(entry.id) }
         let action = visible ? "显示" : "隐藏"
 
         guard await writeVisibility(visible, for: entry) else {
-            statusMessage = "macOS 没有确认「\(entry.displayName)」的\(action)设置写入成功。请重试；如果仍失败，可能是所属应用的偏好文件不可写。"
+            statusMessage = "未能保存「\(entry.appName)」的设置，请重试。"
+            statusIsError = true
             pendingIDs.remove(entry.id)
-            await refresh()
+            await refresh(force: true)
             return
         }
 
+        if let app = runningApplication(bundleID: entry.bundleID) {
+            pendingChanges[entry.id] = PendingChange(visible: visible, pid: app.processIdentifier, launchedAt: app.launchDate)
+        }
         if visible {
             removeRemembered(entry.id)
         } else {
@@ -474,30 +548,27 @@ final class StatusItemModel {
         }
 
         if !entry.isRunning {
-            statusMessage = "已保存「\(entry.displayName)」的\(action)设置；所属应用「\(entry.appName)」下次启动时生效。"
-        } else if entry.isSystemOwned {
-            await ControlCenter.restart()
-            statusMessage = "已保存「\(entry.displayName)」的\(action)设置，并已刷新系统菜单栏。"
+            statusMessage = "已保存，下次打开「\(entry.appName)」时生效。"
         } else if let app = runningApplication(bundleID: entry.bundleID),
                   app.activationPolicy == .accessory {
             if await AppRestart.restart(app) {
-                statusMessage = "已保存「\(entry.displayName)」的\(action)设置，并已重启所属应用「\(entry.appName)」。"
+                statusMessage = "已\(action)「\(entry.displayName)」。"
             } else {
-                statusMessage = "已保存「\(entry.displayName)」的设置，但无法自动重启所属应用「\(entry.appName)」。"
+                statusMessage = "设置已保存，请稍后重新打开「\(entry.appName)」。"
             }
         } else {
-            statusMessage = "已保存「\(entry.displayName)」的\(action)设置；请重启所属应用「\(entry.appName)」后生效。"
+            statusMessage = "已保存，重新打开「\(entry.appName)」后生效。"
         }
 
         pendingIDs.remove(entry.id)
-        await refresh()
+        await refresh(force: true)
     }
 
     /// Restarts the owning app so a change that is waiting for it lands.
     func applyNow(for entry: Entry) async {
-        guard pendingIDs.isEmpty else { return }
+        guard entry.isManageable, !entry.isSystemOwned, pendingIDs.isEmpty, !isRefreshing else { return }
         pendingIDs.insert(entry.id)
-        statusMessage = nil
+        dismissStatus()
         defer { pendingIDs.remove(entry.id) }
 
         let visible = entry.state != .hiding
@@ -505,50 +576,52 @@ final class StatusItemModel {
         if !entry.isRunning {
             statusMessage = "所属应用「\(entry.appName)」没有运行；设置会在它下次启动时应用。"
             pendingIDs.remove(entry.id)
-            await refresh()
+            await refresh(force: true)
             return
-        } else if entry.isSystemOwned {
-            await ControlCenter.restart()
         } else if let app = runningApplication(bundleID: entry.bundleID) {
             guard await AppRestart.restart(app) else {
-                statusMessage = "已保存设置，但无法重启所属应用「\(entry.appName)」。"
+                statusMessage = "设置已保存；「\(entry.appName)」未退出，可稍后重新打开。"
+                statusIsError = true
                 pendingIDs.remove(entry.id)
-                await refresh()
+                await refresh(force: true)
                 return
             }
         } else {
             statusMessage = "所属应用「\(entry.appName)」没有在运行，无法立即应用设置。"
             pendingIDs.remove(entry.id)
-            await refresh()
+            await refresh(force: true)
             return
         }
 
         pendingIDs.remove(entry.id)
-        await refresh()
+        await refresh(force: true)
         let requestedState = visible ? "显示" : "隐藏"
-        statusMessage = "已请求重启所属应用「\(entry.appName)」以应用「\(entry.displayName)」的\(requestedState)设置；列表会在重扫后更新。"
+        statusMessage = "已重新打开「\(entry.appName)」，应用\(requestedState)设置。"
     }
 
     private func writeVisibility(_ visible: Bool, for entry: Entry) async -> Bool {
         let autosaveName = entry.autosaveName
         let bundleID = entry.bundleID
-        return await Task.detached(priority: .userInitiated) {
+        await scanner.invalidate(bundleID: bundleID)
+        let result = await Task.detached(priority: .userInitiated) {
             guard StatusItemPreferences.setVisible(
                 visible,
                 autosaveName: autosaveName,
                 bundleID: bundleID
             ) else { return false }
-            return StatusItemPreferences.isVisible(
-                autosaveName: autosaveName,
-                bundleID: bundleID
-            ) == visible
+            return StatusItemPreferences.isVisible(autosaveName: autosaveName, bundleID: bundleID) == visible
         }.value
+        if result, sandboxPreferences[bundleID] != nil {
+            sandboxPreferences[bundleID]?[StatusItemPreferences.visibleCCPrefix + autosaveName] = .flag(visible)
+            sandboxPreferences[bundleID]?[StatusItemPreferences.visiblePrefix + autosaveName] = .flag(visible)
+        }
+        return result
     }
 
     /// Shows every hidden item at once.
     func showAll() async {
-        let hidden = entries.filter { !$0.isConfiguredVisible && $0.isManageable }
-        guard pendingIDs.isEmpty, !hidden.isEmpty else { return }
+        let hidden = hiddenEntries.filter { !$0.isSystemOwned }
+        guard pendingIDs.isEmpty, !isRefreshing, !hidden.isEmpty else { return }
         for entry in hidden { pendingIDs.insert(entry.id) }
         defer { pendingIDs.removeAll() }
 
@@ -557,6 +630,9 @@ final class StatusItemModel {
         for entry in hidden {
             if await writeVisibility(true, for: entry) {
                 removeRemembered(entry.id)
+                if let app = runningApplication(bundleID: entry.bundleID) {
+                    pendingChanges[entry.id] = PendingChange(visible: true, pid: app.processIdentifier, launchedAt: app.launchDate)
+                }
                 changed.append(entry)
             } else {
                 failed.append(entry)
@@ -566,9 +642,7 @@ final class StatusItemModel {
         var restartedOwners = Set<String>()
         var restartFailures: [String] = []
         for entry in changed where entry.isRunning && restartedOwners.insert(entry.bundleID).inserted {
-            if entry.isSystemOwned {
-                await ControlCenter.restart()
-            } else if let app = runningApplication(bundleID: entry.bundleID),
+            if let app = runningApplication(bundleID: entry.bundleID),
                       app.activationPolicy == .accessory {
                 if !(await AppRestart.restart(app)) {
                     restartFailures.append(entry.appName)
@@ -584,7 +658,7 @@ final class StatusItemModel {
         }).sorted()
 
         pendingIDs.removeAll()
-        await refresh()
+        await refresh(force: true)
         var messages: [String] = []
         if !failed.isEmpty {
             messages.append("\(failed.count) 项设置未写入成功，请检查后重试。")
@@ -599,6 +673,7 @@ final class StatusItemModel {
             messages.append("已保存所有显示设置；未运行的应用会在下次启动时应用。")
         }
         statusMessage = messages.joined(separator: " ")
+        statusIsError = !failed.isEmpty || !restartFailures.isEmpty
     }
 
     // MARK: - Remembered hidden items
@@ -662,38 +737,67 @@ final class StatusItemModel {
                 isRunning: false,
                 order: order,
                 axName: "",
-                isManageable: true
+                isManageable: !isSystemOwned && !bundleID.hasPrefix("com.apple.") && !autosaveName.isEmpty
             )
         }
     }
 
     // MARK: - Icons
 
-    private var iconCache: [String: NSImage] = [:]
+    @ObservationIgnored private var iconCache: [String: NSImage] = [:]
+
+    private func applicationURL(bundleID: String) -> URL? {
+        if let saved = appURLs[bundleID] { return saved }
+        guard !missingApps.contains(bundleID),
+              let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID),
+              FileManager.default.fileExists(atPath: url.path) else {
+            missingApps.insert(bundleID)
+            return nil
+        }
+        appURLs[bundleID] = url
+        return url
+    }
 
     private func icon(for app: NSRunningApplication) -> NSImage? {
-        let key = app.bundleIdentifier ?? ""
-        if let cached = iconCache[key] { return cached }
-        guard let url = app.bundleURL else { return nil }
-        let image = NSWorkspace.shared.icon(forFile: url.path)
-        iconCache[key] = image
-        return image
+        guard let id = app.bundleIdentifier, let url = app.bundleURL else { return nil }
+        appURLs[id] = url
+        return icon(bundleID: id)
     }
 
     private func icon(bundleID: String) -> NSImage? {
         if let cached = iconCache[bundleID] { return cached }
-        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { return nil }
-        let image = NSWorkspace.shared.icon(forFile: url.path)
-        iconCache[bundleID] = image
-        return image
+        guard let url = applicationURL(bundleID: bundleID) else { return nil }
+        let source = NSWorkspace.shared.icon(forFile: url.path)
+        let size = NSSize(width: 24, height: 24)
+        let image = NSImage(size: size, flipped: false) { rect in
+            source.draw(in: rect)
+            return true
+        }
+        // Rasterize now instead of retaining a drawing closure holding the
+        // original potentially large icon. Both 1x and 2x displays are sharp.
+        guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 48, pixelsHigh: 48,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
+            let context = NSGraphicsContext(bitmapImageRep: bitmap) else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        image.draw(in: NSRect(x: 0, y: 0, width: 48, height: 48))
+        NSGraphicsContext.restoreGraphicsState()
+        let small = NSImage(size: size)
+        small.addRepresentation(bitmap)
+        if iconCache.count >= 128 { iconCache.removeAll(keepingCapacity: true) }
+        iconCache[bundleID] = small
+        return small
     }
 
     private func installedAppName(bundleID: String) -> String {
-        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID),
-              let bundle = Bundle(url: url) else { return bundleID }
-        return (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
+        if let name = appNames[bundleID] { return name }
+        guard let url = applicationURL(bundleID: bundleID), let bundle = Bundle(url: url) else { return bundleID }
+        let name = (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
             ?? (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String)
-            ?? bundleID
+            ?? url.deletingPathExtension().lastPathComponent
+        appNames[bundleID] = name
+        return name
     }
 
     // MARK: - Helpers

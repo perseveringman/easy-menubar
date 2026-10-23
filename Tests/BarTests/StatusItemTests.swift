@@ -32,13 +32,14 @@ final class ModelTests: XCTestCase {
             StatusItemModel.Entry(id: "item-\(index)", bundleID: "test.bar", appName: "Test", autosaveName: "item-\(index)", displayName: "Test", state: state, isSystemOwned: false, icon: nil, isRunning: index < 4, order: nil, axName: "", isManageable: true)
         }
         let model = StatusItemModel(entries: entries)
-        let allSections = model.onScreenEntries + model.offScreenEntries + model.waitingToShowEntries + model.inactiveEntries
+        let allSections = model.shownEntries + model.hiddenEntries + model.inactiveEntries + model.unmanagedEntries
         XCTAssertEqual(allSections.count, entries.count)
         XCTAssertEqual(Set(allSections.map(\.id)).count, entries.count)
         XCTAssertTrue(model.hasHiddenItems)
         let inactiveOnly = StatusItemModel(entries: [entries.last!])
         XCTAssertTrue(inactiveOnly.hasHiddenItems, "Restore all must remain available for stopped apps")
-        XCTAssertTrue(inactiveOnly.offScreenEntries.isEmpty)
+        XCTAssertEqual(inactiveOnly.hiddenEntries.count, 1)
+        XCTAssertTrue(inactiveOnly.inactiveEntries.isEmpty)
     }
 
     @MainActor
@@ -48,7 +49,9 @@ final class ModelTests: XCTestCase {
         let unreadable = model.entries(bundleID: "test.bar", appName: "Test", icon: nil, isSystemOwned: false, isRunning: true, records: records, axItems: [], isReadable: false)
         XCTAssertEqual(unreadable.first?.state, .shown)
         let readable = model.entries(bundleID: "test.bar", appName: "Test", icon: nil, isSystemOwned: false, isRunning: true, records: records, axItems: [], isReadable: true)
-        XCTAssertEqual(readable.first?.state, .showing)
+        XCTAssertEqual(readable.first?.state, .shown, "An old visible preference is not a request to restart")
+        XCTAssertEqual(readable.first?.observedVisible, false)
+        XCTAssertNil(unreadable.first?.observedVisible)
     }
 
     @MainActor
@@ -60,6 +63,21 @@ final class ModelTests: XCTestCase {
             XCTAssertEqual(entries.count, 1)
             XCTAssertEqual(entries.first?.isManageable, false)
         }
+    }
+
+    @MainActor
+    func testAmbiguousMultipleItemsDoNotBorrowAnotherIconsNameOrClaimItsVisibility() {
+        let model = StatusItemModel()
+        let records = [
+            StatusItemPreferences.Record(autosaveName: "Clock", isVisible: true, position: 0, hasKnownPosition: false),
+            StatusItemPreferences.Record(autosaveName: "Focus", isVisible: false, position: 0, hasKnownPosition: false),
+        ]
+        let ax = [AXStatusItem(name: "Different unnamed item", frame: CGRect(x: 10, y: 0, width: 20, height: 24))]
+        let entries = model.entries(bundleID: "test.multiple", appName: "Utility", icon: nil, isSystemOwned: false,
+            isRunning: true, records: records, axItems: ax, isReadable: true)
+        XCTAssertEqual(entries.map(\.displayName), ["Utility · Clock", "Utility · Focus"])
+        XCTAssertTrue(entries.allSatisfy { $0.observedVisible == nil })
+        XCTAssertFalse(entries.contains { $0.isPending })
     }
 
     @MainActor
