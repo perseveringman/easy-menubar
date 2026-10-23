@@ -3,6 +3,7 @@ import SwiftUI
 
 extension Notification.Name {
     static let barFocusSearch = Notification.Name("BarFocusSearch")
+    static let barRestoreMenuBarEntry = Notification.Name("BarRestoreMenuBarEntry")
 }
 
 @main
@@ -61,7 +62,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hasLaunched = false
     private var didPresentWindow = false
 
-    func bind(_ model: StatusItemModel) { self.model = model }
+    func bind(_ model: StatusItemModel) {
+        self.model = model
+        startIfNeeded()
+    }
 
     func attachWindow(_ window: NSWindow?) {
         guard let window, self.window !== window else { return }
@@ -85,16 +89,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        hasLaunched = true
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        item.button?.image = NSImage(systemSymbolName: "eye.slash", accessibilityDescription: "Bar")
-        item.button?.image?.isTemplate = true
-        item.button?.target = self
-        item.button?.action = #selector(handleStatusItemClick(_:))
-        item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
-        item.button?.toolTip = "Bar · 显示或收起窗口，右键显示菜单"
-        statusItem = item
+        startIfNeeded()
+    }
 
+    /// Either SwiftUI's first content task or AppKit's launch callback can
+    /// arrive first. Both must lead to exactly one live menu-bar entry.
+    private func startIfNeeded() {
+        guard !hasLaunched else { return }
+        hasLaunched = true
+        restoreMenuBarEntry()
+
+        observe(.barRestoreMenuBarEntry) { [weak self] _ in
+            self?.restoreMenuBarEntry()
+            self?.model?.reportMenuBarRecovery()
+        }
         observe(NSApplication.didBecomeActiveNotification) { [weak self] _ in self?.requestRefresh() }
         let workspace = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
@@ -109,6 +117,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.requestRefresh(force: true)
         }
         if window != nil { openWindow() }
+    }
+
+    private func restoreMenuBarEntry() {
+        if let statusItem { NSStatusBar.system.removeStatusItem(statusItem) }
+        MenuBarEntryPreferences.prepare()
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        item.autosaveName = MenuBarEntryPreferences.name
+        item.isVisible = true
+        item.button?.image = NSImage(systemSymbolName: "eye.slash", accessibilityDescription: "Bar")
+        item.button?.image?.isTemplate = true
+        item.button?.target = self
+        item.button?.action = #selector(handleStatusItemClick(_:))
+        item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        item.button?.toolTip = "Bar · 显示或收起窗口，右键显示菜单"
+        item.button?.setAccessibilityLabel("Bar · 菜单栏图标管理")
+        statusItem = item
+        updateStatusItemIcon(hasHidden: model?.hasHiddenItems ?? false)
     }
 
     private func observe(_ name: Notification.Name, object: AnyObject? = nil,

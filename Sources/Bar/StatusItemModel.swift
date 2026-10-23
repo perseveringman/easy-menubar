@@ -174,6 +174,11 @@ final class StatusItemModel {
 
     func dismissStatus() { statusMessage = nil; statusIsError = false }
 
+    func reportMenuBarRecovery() {
+        statusMessage = "已恢复 Bar 图标，请查看菜单栏右侧。"
+        statusIsError = false
+    }
+
     private func filter(_ source: [Entry]) -> [Entry] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return source }
@@ -298,6 +303,9 @@ final class StatusItemModel {
     func rescan() async {
         await scanner.invalidate()
         missingApps.removeAll()
+        appURLs.removeAll(keepingCapacity: true)
+        appNames.removeAll(keepingCapacity: true)
+        iconCache.removeAll(keepingCapacity: true)
         await refresh(force: true)
         if sandboxEnabled { readSandboxPreferences() }
     }
@@ -747,7 +755,8 @@ final class StatusItemModel {
     @ObservationIgnored private var iconCache: [String: NSImage] = [:]
 
     private func applicationURL(bundleID: String) -> URL? {
-        if let saved = appURLs[bundleID] { return saved }
+        if let saved = appURLs[bundleID], FileManager.default.fileExists(atPath: saved.path) { return saved }
+        appURLs.removeValue(forKey: bundleID)
         guard !missingApps.contains(bundleID),
               let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID),
               FileManager.default.fileExists(atPath: url.path) else {

@@ -124,6 +124,9 @@ struct ContentView: View {
                     Button("全部显示", systemImage: "eye") { confirmsShowAll = true }
                         .disabled(!model.hasHiddenItems || model.isBusy || model.isRefreshing)
                     Button("系统菜单栏设置…", systemImage: "menubar.rectangle") { openMenuBarSettings() }
+                    Button("找回 Bar 图标", systemImage: "arrow.uturn.backward") {
+                        NotificationCenter.default.post(name: .barRestoreMenuBarEntry, object: nil)
+                    }
                     Divider()
                     Button("使用说明与权限…", systemImage: "questionmark.circle") { showsHelp = true }
                 } label: { Image(systemName: "ellipsis.circle") }
@@ -255,6 +258,8 @@ private struct HelpView: View {
         VStack(alignment: .leading, spacing: 14) {
             Text("只留下常用的图标").font(.headline)
             Text("打开开关来显示图标，关闭开关来隐藏。菜单栏工具会重新打开以应用设置，其他应用会提示你稍后重新打开。")
+            Text("Bar 的眼睛图标启动时优先靠右显示。找不到时，可从窗口右上角的更多菜单选择“找回 Bar 图标”。")
+                .font(.caption).foregroundStyle(.secondary)
             Divider()
             Text("更多图标信息 · 可选权限").font(.subheadline.weight(.medium))
             Text("辅助功能权限用于读取图标名称、位置和显示状态。不授权也可以管理已列出的图标。")
